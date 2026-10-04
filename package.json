@@ -1,0 +1,12 @@
+{
+  "name": "multiverz-pvp",
+  "version": "5.0.0",
+  "description": "Servidor PvP online de MultiverZ",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
