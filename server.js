@@ -13,7 +13,7 @@ app.get('/health', (_, res) => res.send('ok'));
 
 const MAX_ID = 55;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
-const queues = { 1: [], 2: [], 3: [] };
+const queues = { 1: [], 2: [], 3: [], raid: [] };   // raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida
 
 const validTeam = (mode, t) =>
@@ -43,8 +43,9 @@ function tryMatch(mode) {
     const wx = WX[Math.floor(Math.random() * WX.length)];
     const m = { a: a.s, b: b.s, t: null, got: new Set(), done: new Set() };
     matches.set(a.s.id, m); matches.set(b.s.id, m);
-    a.s.emit('match', { host: true,  seed, wx, me: a.team, opp: b.team });
-    b.s.emit('match', { host: false, seed, wx, me: b.team, opp: a.team });
+    const raid = mode === 'raid';   // en raid, "opp" es el equipo del compañero
+    a.s.emit('match', { host: true,  seed, wx, me: a.team, opp: b.team, raid });
+    b.s.emit('match', { host: false, seed, wx, me: b.team, opp: a.team, raid });
   }
 }
 
@@ -55,6 +56,14 @@ io.on('connection', s => {
     endMatch(s); unqueue(s);
     queues[mode].push({ s, team: d.team });
     tryMatch(mode);
+  });
+
+  // RaidOnline: dos jugadores (2 personajes cada uno) se emparejan como compañeros
+  s.on('findraid', d => {
+    if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
+    endMatch(s); unqueue(s);
+    queues.raid.push({ s, team: d.team });
+    tryMatch('raid');
   });
 
   s.on('cancel', () => unqueue(s));
