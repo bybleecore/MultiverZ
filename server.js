@@ -85,11 +85,29 @@ io.on('connection', s => {
   s.on('disconnect', () => { unqueue(s); endMatch(s); });
 });
 
-// ===== Mundo online: jardín compartido con estanque en el centro =====
+// ===== Mundo abierto: jardín compartido con estanque, chat y gemas escondidas =====
 const WW = 2400, WH = 1800, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
 const world = new Map();           // socket.id -> { id, name, av, x, y, t, dirty }
 const pub = p => ({ id: p.id, name: p.name, av: p.av, x: Math.round(p.x), y: Math.round(p.y) });
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// --- Chat ---
+const chatLog = [];                                  // últimos mensajes (se envían al entrar)
+function pushChat(m) { chatLog.push(m); if (chatLog.length > 30) chatLog.shift(); io.to('world').emit('wmsg', m); }
+const cleanMsg = v => String(v || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+
+// --- Gemas escondidas (las ve y recoge quien llegue primero) ---
+const GEM_N = 12, GEM_RESPAWN = 45000, GEM_VALS = [20, 20, 20, 20, 50, 50, 150];
+const gems = new Map(); let gemSeq = 0;
+function gemSpawn() {
+  for (let k = 0; k < 40; k++) {
+    const x = 80 + Math.random() * (WW - 160), y = 80 + Math.random() * (WH - 160);
+    if (Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
+    const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y) };
+    gems.set(g.id, g); io.to('world').emit('wgnew', g); return;
+  }
+}
+for (let i = 0; i < GEM_N; i++) gemSpawn();
 
 function worldRemove(s) {
   if (!world.delete(s.id)) return;
@@ -104,8 +122,8 @@ io.on('connection', s => {
     const name = String((d && d.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14) || 'Jugador';
     const av = d && Number.isInteger(d.av) && d.av >= 0 && d.av <= MAX_ID ? d.av : 0;
     const a = Math.random() * Math.PI * 2, r = POND.r + 150 + Math.random() * 150;
-    const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false };
-    s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub) });
+    const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false, lc: 0 };
+    s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub), gems: [...gems.values()], chat: chatLog });
     world.set(s.id, p);
     s.join('world');
     s.to('world').emit('wjoined', pub(p));
@@ -123,6 +141,26 @@ io.on('connection', s => {
     x = clamp(x, 20, WW - 20); y = clamp(y, 20, WH - 20);
     if (Math.hypot(x - POND.x, y - POND.y) < POND.r - 10) return;              // no se puede entrar al agua
     p.x = x; p.y = y; p.dirty = true;
+  });
+
+  s.on('wchat', d => {
+    const p = world.get(s.id);
+    if (!p || !d) return;
+    const text = cleanMsg(d.text), now = Date.now();
+    if (!text || now - p.lc < 700) return;          // anti-spam: 1 mensaje cada 0,7 s
+    p.lc = now;
+    pushChat({ id: s.id, name: p.name, text });
+  });
+
+  s.on('wgem', d => {
+    const p = world.get(s.id), g = d && gems.get(d.id);
+    if (!p || !g || Math.hypot(p.x - g.x, p.y - g.y) > 110) return;   // tiene que estar cerca de verdad
+    gems.delete(g.id);
+    const amt = GEM_VALS[Math.floor(Math.random() * GEM_VALS.length)];
+    s.emit('wgot', { id: g.id, amt });
+    io.to('world').emit('wgone', g.id);
+    pushChat({ sys: true, text: '💎 ' + p.name + ' encontró una gema de ' + amt });
+    setTimeout(gemSpawn, GEM_RESPAWN);
   });
 
   s.on('wleave', () => worldRemove(s));
