@@ -182,7 +182,7 @@ if (!ADMIN_KEY) console.warn('⚠ ADMIN_KEY no está definida: el panel /admin e
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
-const MAX_ID = 80;                 // sube este número cuando agregues personajes
+const MAX_ID = 90;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
 const queues = { pvp: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida en curso
