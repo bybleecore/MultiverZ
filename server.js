@@ -11,7 +11,7 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
-const MAX_ID = 55;                 // sube este número cuando agregues personajes
+const MAX_ID = 80;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
 const queues = { 1: [], 2: [], 3: [], raid: [] };   // raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida
@@ -84,6 +84,58 @@ io.on('connection', s => {
   s.on('leave', () => endMatch(s));
   s.on('disconnect', () => { unqueue(s); endMatch(s); });
 });
+
+// ===== Mundo online: jardín compartido con estanque en el centro =====
+const WW = 2400, WH = 1800, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
+const world = new Map();           // socket.id -> { id, name, av, x, y, t, dirty }
+const pub = p => ({ id: p.id, name: p.name, av: p.av, x: Math.round(p.x), y: Math.round(p.y) });
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function worldRemove(s) {
+  if (!world.delete(s.id)) return;
+  s.leave('world');
+  io.to('world').emit('wleft', s.id);
+}
+
+io.on('connection', s => {
+  s.on('wjoin', d => {
+    if (world.has(s.id)) return;
+    if (world.size >= MAX_WORLD) return s.emit('wfull');
+    const name = String((d && d.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14) || 'Jugador';
+    const av = d && Number.isInteger(d.av) && d.av >= 0 && d.av <= MAX_ID ? d.av : 0;
+    const a = Math.random() * Math.PI * 2, r = POND.r + 150 + Math.random() * 150;
+    const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false };
+    s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub) });
+    world.set(s.id, p);
+    s.join('world');
+    s.to('world').emit('wjoined', pub(p));
+  });
+
+  s.on('wmove', d => {
+    const p = world.get(s.id);
+    if (!p || !d) return;
+    let x = Number(d.x), y = Number(d.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const now = Date.now(), dt = Math.min(1, (now - p.t) / 1000);
+    p.t = now;
+    const max = SPEED * 1.6 * dt + 12, dx = x - p.x, dy = y - p.y, dist = Math.hypot(dx, dy);
+    if (dist > max) { x = p.x + dx / dist * max; y = p.y + dy / dist * max; }   // límite de velocidad
+    x = clamp(x, 20, WW - 20); y = clamp(y, 20, WH - 20);
+    if (Math.hypot(x - POND.x, y - POND.y) < POND.r - 10) return;              // no se puede entrar al agua
+    p.x = x; p.y = y; p.dirty = true;
+  });
+
+  s.on('wleave', () => worldRemove(s));
+  s.on('disconnect', () => worldRemove(s));
+});
+
+// Cada 80 ms se envían solo las posiciones que cambiaron
+setInterval(() => {
+  const ch = [...world.values()].filter(p => p.dirty);
+  if (!ch.length) return;
+  io.to('world').emit('wpos', ch.map(p => [p.id, Math.round(p.x), Math.round(p.y)]));
+  ch.forEach(p => { p.dirty = false; });
+}, 80);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('MultiverZ PvP en puerto ' + PORT));
