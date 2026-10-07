@@ -966,6 +966,12 @@ function wDraw(t){const c=wd.cx,cv=wd.cv,wc=$('#wc');if(!wc)return;const vw=wc.c
  c.fillStyle='#ebdfb6';c.beginPath();c.arc(px,py,PND.r+20,0,6.283);c.fill();
  const gr=c.createRadialGradient(px,py,PND.r*.1,px,py,PND.r);gr.addColorStop(0,'#5fd0ff');gr.addColorStop(1,'#1f7fd6');c.fillStyle=gr;c.beginPath();c.arc(px,py,PND.r,0,6.283);c.fill();
  c.strokeStyle='rgba(255,255,255,.28)';c.lineWidth=2;for(let k=0;k<4;k++){c.beginPath();c.arc(px,py,PND.r*(.3+.17*k)+4*Math.sin(t/800+k*1.7),0,6.283);c.stroke()}
+ for(let i=0;i<4;i++){const per=2600+i*700,tt=t+i*900,cyc=Math.floor(tt/per),ph=(tt%per)/per;if(ph>.55)continue;
+  const h1=Math.sin(cyc*127.1+i*311.7)*43758.5453,r1=h1-Math.floor(h1),h2=Math.sin(cyc*269.5+i*183.3)*43758.5453,r2=h2-Math.floor(h2);
+  const an=r1*6.283,ds=Math.sqrt(r2)*PND.r*.72,sx=px+Math.cos(an)*ds,sy=py+Math.sin(an)*ds,q=ph/.55;
+  c.save();c.globalAlpha=1-q;c.strokeStyle='#fff';c.lineWidth=2.5;c.beginPath();c.ellipse(sx,sy,6+q*28,(6+q*28)*.5,0,0,6.283);c.stroke();c.beginPath();c.ellipse(sx,sy,3+q*14,(3+q*14)*.5,0,0,6.283);c.stroke();
+  c.fillStyle='#fff';for(let j=0;j<6;j++){const a=j/6*6.283+r1*3,rr=q*22,hh=Math.sin(q*3.14159)*26;c.beginPath();c.arc(sx+Math.cos(a)*rr,sy+Math.sin(a)*rr*.5-hh,2.4*(1-q)+.8,0,6.283);c.fill()}
+  c.restore()}
  for(const l of wdc.lp){const x=l.x-camX,y=l.y-camY;if(x<-40||y<-40||x>vw+40||y>vh+40)continue;const b=Math.sin(t/1200+l.a)*2;c.fillStyle='#3f9d4a';c.beginPath();c.ellipse(x,y+b,l.r,l.r*.7,l.a,0,6.283);c.fill();c.fillStyle='#ff8fb8';c.beginPath();c.arc(x,y+b,3,0,6.283);c.fill()}
  const vis=(x,y,m)=>x>camX-m&&x<camX+vw+m&&y>camY-m&&y<camY+vh+m;
  c.strokeStyle='#3f9d4a';c.lineWidth=2;for(const f of wdc.tf)if(vis(f.x,f.y,10)){c.beginPath();c.moveTo(f.x-camX,f.y-camY);c.lineTo(f.x-camX-2,f.y-camY-f.h);c.moveTo(f.x-camX+3,f.y-camY);c.lineTo(f.x-camX+4,f.y-camY-f.h+1);c.stroke()}
@@ -994,10 +1000,10 @@ function wFishStart(){if(!wd||!wd.joined||wd.fish)return;
  const left=fishLeft();if(left<=0){toast('🎣 Ya usaste tus '+FISH_MAX+' pescas de hoy. ¡Vuelve mañana!');return}
  const wc=$('#wc');if(!wc)return;wd.keys={};wd.joy={x:0,y:0};const jk=$('#wjk');if(jk)jk.style.transform='';
  const o=document.createElement('div');o.id='wfish';
- o.innerHTML=`<button class="b g" style="position:absolute;top:10px;right:10px;margin:0;padding:6px 12px;font-size:13px" onclick="event.stopPropagation();wFishEnd()">✕ Salir</button><div id="fhd">🎣 Pesca · usos hoy: ${left}/${FISH_MAX}</div><div id="fbw"><div id="fbar"><b class="fr" style="width:27%"></b><b class="fy" style="width:18%"></b><b class="fg" style="width:10%"></b><b class="fy" style="width:18%"></b><b class="fr" style="width:27%"></b></div><i id="fmk"></i></div><div id="ftx">Presiona espacio o aprieta la pantalla para pescar</div><div id="fres"></div>`;
+ o.innerHTML=`<button class="b g" style="position:absolute;top:10px;right:10px;margin:0;padding:6px 12px;font-size:13px" onclick="event.stopPropagation();wFishEnd()">✕ Salir</button><div id="fhd">🎣 Pesca · usos hoy: ${left}/${FISH_MAX}</div><div id="fbw"><div id="fbar"><b class="fr" style="width:30%"></b><b class="fy" style="width:18%"></b><b class="fg" style="width:4%"></b><b class="fy" style="width:18%"></b><b class="fr" style="width:30%"></b></div><i id="fmk"></i></div><div id="ftx">Presiona espacio o aprieta la pantalla para pescar</div><div id="fres"></div>`;
  o.onclick=wFishHit;wc.appendChild(o);wd.fish={t0:Date.now()-Math.random()*1500,done:0,raf:0};
  const tick=()=>{if(!wd||!wd.fish||!$('#wfish'))return;const k=$('#fmk');if(k&&!wd.fish.done)k.style.left=(fishPos()*100)+'%';wd.fish.raf=requestAnimationFrame(tick)};tick()}
-function wFishHit(){if(!wd||!wd.fish||wd.fish.done)return;const p=fishPos(),d=Math.abs(p-.5),z=d<.05?'g':d<.23?'y':'r';wd.fish.done=1;
+function wFishHit(){if(!wd||!wd.fish||wd.fish.done)return;const p=fishPos(),d=Math.abs(p-.5),z=d<.02?'g':d<.2?'y':'r';wd.fish.done=1;
  const k=$('#fmk');if(k)k.style.left=(p*100)+'%';
  fishLeft();S.fish.n++;
  const pool=z=='g'?(Math.random()<.15?['f150']:['f100']):z=='y'?['f30','f50']:['f10','f15'],id=pool[Math.floor(Math.random()*pool.length)],it=ITEMS[id];
