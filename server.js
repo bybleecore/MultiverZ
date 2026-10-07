@@ -377,7 +377,7 @@ function pushChat(m) { chatLog.push(m); if (chatLog.length > 30) chatLog.shift()
 const cleanMsg = v => String(v || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
 
 // --- Gemas escondidas (las ve y recoge quien llegue primero) ---
-const GEM_N = 12, GEM_D = 30, GEM_VALS_D = [30, 50, 50, 100, 150, 300], GEM_RESET = 2 * 60 * 60 * 1000, GEM_VALS = [20, 20, 20, 20, 50, 50, 150];   // todas las gemas se reinician cada 2 horas
+const GEM_N = 12, GEM_D = 15, GEM_VALS_D = [30, 50, 50, 100, 150, 300], GEM_RESET = 2 * 60 * 60 * 1000, GEM_VALS = [20, 20, 20, 20, 50, 50, 150];   // todas las gemas se reinician cada 2 horas
 const gems = new Map(); let gemSeq = 0;
 function gemSpawn(des) {                             // des = true -> gema del Desierto (parte de arriba del mapa)
   for (let k = 0; k < 40; k++) {
