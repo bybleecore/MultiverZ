@@ -1,4 +1,4 @@
-// Servidor de emparejamiento PvP de MultiverZ
+// Servidor de MultiverZ: emparejamiento PvP/Raid, mundo abierto, cuentas y baneos
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -7,6 +7,177 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+
+// ===== Cuentas por navegador + baneos (se guardan en un archivo del servidor) =====
+// Cada navegador crea un ID (uid) y un token secreto. El servidor los registra en la primera conexión.
+// Variables de entorno:  ADMIN_KEY (clave del panel /admin, obligatoria)  ·  DATA_FILE (ruta del archivo, opcional)
+//                        BANNED_UIDS / BANNED_IPS (listas separadas por comas que sobreviven a los reinicios)
+const crypto = require('crypto');
+const fs = require('fs');
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const cid = v => String(v || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
+const clean = (v, n) => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, n);
+const sha = v => crypto.createHash('sha256').update(String(v)).digest('hex');
+const firstIp = h => String((h && h['x-forwarded-for']) || '').split(',')[0].trim();
+let db = { players: {}, bans: {}, ipbans: {}, gifts: {} };
+try {
+  const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {} };
+  console.log('Datos cargados: ' + Object.keys(db.players).length + ' jugadores, ' + Object.keys(db.bans).length + ' baneados');
+} catch (e) { console.log('Sin archivo de datos previo: se creará uno nuevo en ' + DATA_FILE); }
+const envBans = new Set((process.env.BANNED_UIDS || '').split(',').map(cid).filter(Boolean));
+const envIps = new Set((process.env.BANNED_IPS || '').split(',').map(x => x.trim()).filter(Boolean));
+let saveT = null, dirty = false;
+function writeNow() {
+  clearTimeout(saveT); dirty = false;
+  const tmp = DATA_FILE + '.tmp';
+  try { fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, DATA_FILE); }
+  catch (e) { console.error('No se pudieron guardar los datos:', e.message); }
+}
+function save() { dirty = true; clearTimeout(saveT); saveT = setTimeout(writeNow, 400); }
+process.on('exit', () => { if (dirty) writeNow(); });                  // no perder cambios pendientes al apagar
+for (const sg of ['SIGTERM', 'SIGINT']) process.on(sg, () => process.exit(0));
+const banInfo = uid => db.bans[uid] || (envBans.has(uid) ? { reason: 'Baneo permanente', env: true } : null);
+const ipBanned = ip => !!ip && !!(db.ipbans[ip] || envIps.has(ip));
+const online = new Map();                 // uid -> Set(sockets)
+const sockIp = s => firstIp(s.handshake.headers) || s.handshake.address || '';
+const regIp = new Map();                  // límite de cuentas nuevas por IP
+
+io.use((s, next) => {
+  const a = s.handshake.auth || {};
+  const uid = cid(a.uid), tok = String(a.tok || '').slice(0, 64), ip = sockIp(s);
+  if (uid.length < 8 || tok.length < 16) return next(new Error('actualiza'));
+  const ban = banInfo(uid);
+  if (ban || ipBanned(ip)) {
+    const e = new Error('baneado');
+    e.data = { reason: ban ? ban.reason : 'Tu conexión está bloqueada' };
+    return next(e);
+  }
+  const now = Date.now(), h = sha(tok);
+  let p = db.players[uid];
+  if (p && p.tok && p.tok !== h) return next(new Error('id_en_uso'));
+  if (!p) {
+    const r = regIp.get(ip) || { n: 0, t: now };
+    if (now - r.t > 3600000) { r.n = 0; r.t = now; }
+    if (r.n >= 30) return next(new Error('demasiados'));
+    r.n++; regIp.set(ip, r);
+    p = db.players[uid] = { name: 'Jugador', tok: h, first: now, last: now, ips: [] };
+  }
+  p.last = now;
+  const nm = clean(a.name, 14); if (nm) p.name = nm;
+  if (ip && !p.ips.includes(ip)) { p.ips.push(ip); if (p.ips.length > 5) p.ips.shift(); }
+  save();
+  s.data.uid = uid; s.data.ip = ip;
+  next();
+});
+
+io.on('connection', s => {
+  const uid = s.data.uid;
+  if (!online.has(uid)) online.set(uid, new Set());
+  online.get(uid).add(s);
+  if (db.gifts[uid] && db.gifts[uid].length) s.emit('gifts', db.gifts[uid]);   // regalos pendientes del admin
+  s.on('giftok', ids => {                                                      // el jugador confirma que ya los cobró
+    if (!Array.isArray(ids) || !db.gifts[uid]) return;
+    const ok = new Set(ids.slice(0, 50).map(x => String(x)));
+    db.gifts[uid] = db.gifts[uid].filter(g => !ok.has(g.id));
+    if (!db.gifts[uid].length) delete db.gifts[uid];
+    save();
+  });
+  s.on('disconnect', () => {
+    const o = online.get(uid);
+    if (o) { o.delete(s); if (!o.size) online.delete(uid); }
+    const p = db.players[uid]; if (p) { p.last = Date.now(); save(); }
+  });
+});
+
+function kickSock(s, reason) { s.emit('banned', { reason }); s.disconnect(true); }
+function banUid(uid, reason, alsoIp) {
+  const p = db.players[uid];
+  db.bans[uid] = { reason: clean(reason, 80) || 'Trampas', at: Date.now(), name: p ? p.name : '?' };
+  if (alsoIp && p) for (const ip of p.ips) db.ipbans[ip] = { uid, at: Date.now() };
+  save();
+  let n = 0;
+  for (const s of [...(online.get(uid) || [])]) { kickSock(s, db.bans[uid].reason); n++; }
+  if (alsoIp) for (const set of [...online.values()]) for (const s of [...set]) if (ipBanned(s.data.ip)) { kickSock(s, 'Tu conexión está bloqueada'); n++; }
+  return n;
+}
+function unbanUid(uid) {
+  delete db.bans[uid];
+  for (const ip in db.ipbans) if (db.ipbans[ip].uid === uid) delete db.ipbans[ip];
+  save();
+}
+
+// --- Panel de administración (/admin) ---
+app.use('/admin/api', express.json({ limit: '200kb' }));
+const fails = new Map();
+const keyOk = k => crypto.timingSafeEqual(Buffer.from(sha(k), 'hex'), Buffer.from(sha(ADMIN_KEY), 'hex'));
+function adminAuth(req, res, next) {
+  if (!ADMIN_KEY) return res.status(503).json({ error: 'Falta definir ADMIN_KEY en el servidor' });
+  const ip = firstIp(req.headers) || (req.socket && req.socket.remoteAddress) || '?', now = Date.now();
+  const f = fails.get(ip) || { n: 0, t: now };
+  if (now - f.t > 600000) { f.n = 0; f.t = now; }
+  if (f.n >= 10) return res.status(429).json({ error: 'Demasiados intentos. Espera 10 minutos' });
+  if (!keyOk(req.get('x-admin-key') || '')) { f.n++; fails.set(ip, f); return res.status(401).json({ error: 'Clave incorrecta' }); }
+  next();
+}
+app.get('/admin', (_, res) => { res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' }); res.sendFile(path.join(__dirname, 'admin.html')); });
+app.get('/admin/api/players', adminAuth, (req, res) => {
+  const q = clean(req.query && req.query.q, 30).toLowerCase();
+  const list = Object.entries(db.players)
+    .filter(([uid, p]) => !q || uid.toLowerCase().includes(q) || String(p.name).toLowerCase().includes(q))
+    .sort((a, b) => b[1].last - a[1].last).slice(0, 200)
+    .map(([uid, p]) => { const b = banInfo(uid); return { uid, name: p.name, first: p.first, last: p.last, online: online.has(uid), gifts: (db.gifts[uid] || []).length, ips: p.ips.slice(-3), banned: !!b, reason: b ? b.reason : '' }; });
+  res.json({ total: Object.keys(db.players).length, online: online.size, list });
+});
+app.get('/admin/api/bans', adminAuth, (_, res) => {
+  const list = [...new Set([...Object.keys(db.bans), ...envBans])].map(uid => { const b = banInfo(uid), p = db.players[uid]; return { uid, name: (b && b.name) || (p && p.name) || '?', reason: b.reason, at: b.at || 0, env: !!b.env && !db.bans[uid] }; });
+  res.json({ list, ips: Object.keys(db.ipbans), envIps: [...envIps] });
+});
+app.post('/admin/api/ban', adminAuth, (req, res) => {
+  const uid = cid(req.body && req.body.uid);
+  if (uid.length < 8) return res.status(400).json({ error: 'ID inválido' });
+  const kicked = banUid(uid, req.body.reason, !!req.body.ip);
+  res.json({ ok: true, kicked });
+});
+app.post('/admin/api/unban', adminAuth, (req, res) => {
+  const uid = cid(req.body && req.body.uid);
+  if (!uid) return res.status(400).json({ error: 'ID inválido' });
+  const env = envBans.has(uid) && !db.bans[uid];
+  unbanUid(uid);
+  res.json({ ok: true, env });
+});
+app.post('/admin/api/gift', adminAuth, (req, res) => {          // regalar gemas / tickets a una cuenta
+  const b = req.body || {}, uid = cid(b.uid);
+  const gems = Math.floor(Number(b.gems) || 0), tk = Math.floor(Number(b.tk) || 0);
+  if (!db.players[uid]) return res.status(404).json({ error: 'Esa cuenta no está registrada' });
+  if (gems < 0 || tk < 0 || gems > 100000 || tk > 1000 || (!gems && !tk)) return res.status(400).json({ error: 'Cantidad inválida (gemas 0-100000, tickets 0-1000)' });
+  const list = db.gifts[uid] = db.gifts[uid] || [];
+  if (list.length >= 20) return res.status(400).json({ error: 'Ya tiene 20 regalos pendientes' });
+  list.push({ id: crypto.randomBytes(6).toString('hex'), gems, tk, msg: clean(b.msg, 80), at: Date.now() });
+  save();
+  let sent = 0;
+  for (const s of [...(online.get(uid) || [])]) { s.emit('gifts', list); sent++; }
+  res.json({ ok: true, delivered: sent > 0 });
+});
+app.get('/admin/api/backup', adminAuth, (_, res) => {
+  const uids = [...new Set([...Object.keys(db.bans), ...envBans])], ips = [...new Set([...Object.keys(db.ipbans), ...envIps])];
+  res.json({ bans: db.bans, ipbans: db.ipbans, BANNED_UIDS: uids.join(','), BANNED_IPS: ips.join(',') });
+});
+app.post('/admin/api/restore', adminAuth, (req, res) => {
+  const b = (req.body && req.body.bans) || {}, ib = (req.body && req.body.ipbans) || {};
+  let n = 0;
+  for (const k of Object.keys(b).slice(0, 5000)) {
+    const uid = cid(k); if (uid.length < 8) continue;
+    const v = b[k] || {}; if (!db.bans[uid]) n++;
+    banUid(uid, v.reason, false);
+    db.bans[uid].name = clean(v.name, 14) || db.bans[uid].name;
+  }
+  for (const ip of Object.keys(ib).slice(0, 5000)) db.ipbans[clean(ip, 64)] = { uid: cid(ib[ip] && ib[ip].uid), at: Date.now() };
+  save();
+  res.json({ ok: true, added: n });
+});
+if (!ADMIN_KEY) console.warn('⚠ ADMIN_KEY no está definida: el panel /admin está desactivado hasta que la configures');
 
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
