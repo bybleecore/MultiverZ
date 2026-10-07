@@ -116,7 +116,23 @@ function gemReset() {                                // cada 2 h: se borran las 
 }
 setInterval(gemReset, GEM_RESET);
 
+// --- Amigos: solicitudes, regalo de gemas y mensajes directos ---
+const FR_GIFT = 25;                                   // gemas para cada uno al hacerse amigos (una vez por pareja)
+const uidSock = new Map();                            // uid del jugador -> socket.id (solo mientras está en el mundo)
+const pend = new Map();                               // 'origen>destino' -> hora de la solicitud
+const gifted = new Set();                             // parejas que ya cobraron el regalo
+const cleanUid = v => String(v || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
+const pairKey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+const areFriends = (p, q) => !!(p && q && p.uid && q.uid && p.fr.has(q.uid) && q.fr.has(p.uid));
+const pendOk = k => pend.has(k) && Date.now() - pend.get(k) < 300000;   // las solicitudes caducan a los 5 min
+
 function worldRemove(s) {
+  const p0 = world.get(s.id);
+  if (p0 && p0.uid && uidSock.get(p0.uid) === s.id) uidSock.delete(p0.uid);
+  for (const k of [...pend.keys()]) if (k.startsWith(s.id + '>') || k.endsWith('>' + s.id)) pend.delete(k);
+  worldRemove0(s);
+}
+function worldRemove0(s) {
   if (!world.delete(s.id)) return;
   s.leave('world');
   io.to('world').emit('wleft', s.id);
@@ -129,7 +145,9 @@ io.on('connection', s => {
     const name = String((d && d.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14) || 'Jugador';
     const av = d && Number.isInteger(d.av) && d.av >= 0 && d.av <= MAX_ID ? d.av : 0;
     const a = Math.random() * Math.PI * 2, r = POND.r + 150 + Math.random() * 150;
-    const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false, lc: 0 };
+    const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false, lc: 0, ld: 0, lr: 0,
+      uid: cleanUid(d && d.uid), fr: new Set((Array.isArray(d && d.fr) ? d.fr : []).slice(0, 300).map(cleanUid)) };
+    if (p.uid) uidSock.set(p.uid, s.id);
     s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub), gems: [...gems.values()], chat: chatLog });
     world.set(s.id, p);
     s.join('world');
@@ -167,6 +185,68 @@ io.on('connection', s => {
     s.emit('wgot', { id: g.id, amt });
     io.to('world').emit('wgone', g.id);
     pushChat({ sys: true, text: '💎 ' + p.name + ' encontró una gema de ' + amt });
+  });
+
+  // Estado de otro jugador al tocarlo: ¿amigo?, ¿solicitud enviada o recibida?
+  s.on('fprof', d => {
+    const p = world.get(s.id), q = d && world.get(d.to);
+    if (!p || !q || q === p) return;
+    const friend = areFriends(p, q);
+    s.emit('fprof', { id: q.id, friend, uid: friend ? q.uid : null, pending: pendOk(s.id + '>' + q.id), incoming: pendOk(q.id + '>' + s.id) });
+  });
+
+  s.on('frreq', d => {
+    const p = world.get(s.id), q = d && world.get(d.to), now = Date.now();
+    if (!p || !q || q === p || !p.uid || !q.uid || p.uid === q.uid) return;
+    if (now - p.lr < 1500) return;                    // anti-spam
+    p.lr = now;
+    if (areFriends(p, q)) return s.emit('frmsg', 'Ya sois amigos');
+    if (pendOk(s.id + '>' + q.id)) return s.emit('frmsg', 'Ya le enviaste una solicitud');
+    pend.set(s.id + '>' + q.id, now);
+    io.to(q.id).emit('frreq', { from: p.id, name: p.name, av: p.av });
+  });
+
+  s.on('fracc', d => {
+    const p = world.get(s.id), q = d && world.get(d.to), k = q && (q.id + '>' + s.id);
+    if (!p || !q || !pendOk(k)) return;
+    pend.delete(k);
+    p.fr.add(q.uid); q.fr.add(p.uid);
+    const pk = pairKey(p.uid, q.uid), gift = gifted.has(pk) ? 0 : FR_GIFT;
+    gifted.add(pk);
+    s.emit('frok', { uid: q.uid, name: q.name, av: q.av, gift });
+    io.to(q.id).emit('frok', { uid: p.uid, name: p.name, av: p.av, gift });
+  });
+
+  s.on('frno', d => {
+    const p = world.get(s.id), q = d && world.get(d.to);
+    if (!p || !q) return;
+    if (pend.delete(q.id + '>' + s.id)) io.to(q.id).emit('frno', { name: p.name });
+  });
+
+  s.on('frdel', d => {
+    const p = world.get(s.id), uid = cleanUid(d && d.uid);
+    if (!p || !uid) return;
+    p.fr.delete(uid);
+    const sid = uidSock.get(uid), q = sid && world.get(sid);
+    if (q) { q.fr.delete(p.uid); io.to(q.id).emit('frgone', { uid: p.uid }); }
+  });
+
+  s.on('frstat', d => {                               // ¿cuáles de mis amigos están en el mundo ahora?
+    const p = world.get(s.id);
+    if (!p || !d || !Array.isArray(d.uids)) return;
+    s.emit('frstat', d.uids.slice(0, 300).map(cleanUid).filter(u => { const q = world.get(uidSock.get(u)); return areFriends(p, q); }));
+  });
+
+  s.on('dm', d => {                                   // mensaje directo (solo entre amigos conectados)
+    const p = world.get(s.id);
+    if (!p || !d) return;
+    const uid = cleanUid(d.uid), text = cleanMsg(d.text), now = Date.now();
+    if (!text || now - p.ld < 500) return;
+    p.ld = now;
+    const q = world.get(uidSock.get(uid));
+    if (!areFriends(p, q)) return s.emit('dmfail', { uid });
+    io.to(q.id).emit('dm', { uid: p.uid, name: p.name, text });
+    s.emit('dmok', { uid, text });
   });
 
   s.on('wleave', () => worldRemove(s));
