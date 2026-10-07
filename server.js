@@ -366,7 +366,7 @@ io.on('connection', s => {
 });
 
 // ===== Mundo abierto: jardín compartido con estanque, chat y gemas escondidas =====
-const WW = 2400, WH = 1800, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
+const WW = 2400, WH = 1800, WY0 = -1000, NPC = { x: 1200, y: -760 }, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
 const world = new Map();           // socket.id -> { id, name, av, x, y, t, dirty }
 const pub = p => ({ id: p.id, name: p.name, av: p.av, x: Math.round(p.x), y: Math.round(p.y) });
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -377,21 +377,24 @@ function pushChat(m) { chatLog.push(m); if (chatLog.length > 30) chatLog.shift()
 const cleanMsg = v => String(v || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
 
 // --- Gemas escondidas (las ve y recoge quien llegue primero) ---
-const GEM_N = 12, GEM_RESET = 2 * 60 * 60 * 1000, GEM_VALS = [20, 20, 20, 20, 50, 50, 150];   // todas las gemas se reinician cada 2 horas
+const GEM_N = 12, GEM_D = 30, GEM_VALS_D = [30, 50, 50, 100, 150, 300], GEM_RESET = 2 * 60 * 60 * 1000, GEM_VALS = [20, 20, 20, 20, 50, 50, 150];   // todas las gemas se reinician cada 2 horas
 const gems = new Map(); let gemSeq = 0;
-function gemSpawn() {
+function gemSpawn(des) {                             // des = true -> gema del Desierto (parte de arriba del mapa)
   for (let k = 0; k < 40; k++) {
-    const x = 80 + Math.random() * (WW - 160), y = 80 + Math.random() * (WH - 160);
-    if (Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
-    const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y) };
+    const x = 80 + Math.random() * (WW - 160), y = des ? WY0 + 80 + Math.random() * (-WY0 - 140) : 80 + Math.random() * (WH - 160);
+    if (!des && Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
+    if (des && Math.hypot(x - NPC.x, y - NPC.y) < 150) continue;
+    const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y), d: des ? 1 : 0 };
     gems.set(g.id, g); io.to('world').emit('wgnew', g); return;
   }
 }
 for (let i = 0; i < GEM_N; i++) gemSpawn();
+for (let i = 0; i < GEM_D; i++) gemSpawn(true);
 function gemReset() {                                // cada 2 h: se borran las que quedaban y salen 12 nuevas para todos
   gems.clear();
   io.to('world').emit('wgreset');
   for (let i = 0; i < GEM_N; i++) gemSpawn();
+  for (let i = 0; i < GEM_D; i++) gemSpawn(true);
   if (world.size) pushChat({ sys: true, text: '💎 ¡Las gemas escondidas se reiniciaron! Hay ' + gems.size + ' nuevas por el mapa' });
 }
 setInterval(gemReset, GEM_RESET);
@@ -443,7 +446,7 @@ io.on('connection', s => {
     p.t = now;
     const max = SPEED * 1.6 * dt + 12, dx = x - p.x, dy = y - p.y, dist = Math.hypot(dx, dy);
     if (dist > max) { x = p.x + dx / dist * max; y = p.y + dy / dist * max; }   // límite de velocidad
-    x = clamp(x, 20, WW - 20); y = clamp(y, 20, WH - 20);
+    x = clamp(x, 20, WW - 20); y = clamp(y, WY0 + 20, WH - 20);
     if (Math.hypot(x - POND.x, y - POND.y) < POND.r - 10) return;              // no se puede entrar al agua
     p.x = x; p.y = y; p.dirty = true;
   });
@@ -461,10 +464,10 @@ io.on('connection', s => {
     const p = world.get(s.id), g = d && gems.get(d.id);
     if (!p || !g || Math.hypot(p.x - g.x, p.y - g.y) > 110) return;   // tiene que estar cerca de verdad
     gems.delete(g.id);
-    const amt = GEM_VALS[Math.floor(Math.random() * GEM_VALS.length)];
-    s.emit('wgot', { id: g.id, amt });
+    const vals = g.d ? GEM_VALS_D : GEM_VALS, amt = vals[Math.floor(Math.random() * vals.length)];
+    s.emit('wgot', { id: g.id, amt, d: g.d ? 1 : 0 });
     io.to('world').emit('wgone', g.id);
-    pushChat({ sys: true, text: '💎 ' + p.name + ' encontró una gema de ' + amt });
+    pushChat({ sys: true, text: (g.d ? '🏜️ ' + p.name + ' encontró una joya del desierto de ' : '💎 ' + p.name + ' encontró una gema de ') + amt });
   });
 
   // Estado de otro jugador al tocarlo: ¿amigo?, ¿solicitud enviada o recibida?
