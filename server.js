@@ -1,4 +1,4 @@
-// Servidor de MultiverZ: emparejamiento PvP/Raid, mundo abierto, cuentas y baneos
+// Servidor de MultiverZ 7.0: PvP con votación de modo, chat, Raid, mundo abierto, cuentas y baneos
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -184,8 +184,10 @@ app.get('/health', (_, res) => res.send('ok'));
 
 const MAX_ID = 80;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
-const queues = { 1: [], 2: [], 3: [], raid: [] };   // raid = RaidOnline 2vs2 cooperativo
-const matches = new Map();         // socket.id -> partida
+const queues = { pvp: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
+const matches = new Map();         // socket.id -> partida en curso
+const lobbies = new Map();         // socket.id -> sala previa (votación -> ruleta -> elegir equipo)
+const VOTE_MS = 20000, SPIN_MS = 5200, PICK_MS = 45000;
 
 const validTeam = (mode, t) =>
   Array.isArray(t) && t.length === mode &&
@@ -193,7 +195,24 @@ const validTeam = (mode, t) =>
   t.every(x => x && Number.isInteger(x.id) && x.id >= 1 && x.id <= MAX_ID &&
                 Number.isInteger(x.l) && x.l >= 0 && x.l <= 5);
 
+const ni = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0));
+// Perfil visible para el rival. Nombre = el registrado en el servidor; el resto lo informa el juego del jugador.
+function cleanProf(s, d) {
+  d = d || {};
+  const p = db.players[s.data.uid];
+  return { name: (p && p.name) || 'Jugador', av: ni(d.av, MAX_ID), gems: ni(d.gems, 1e9), chars: ni(d.chars, MAX_ID),
+           wins: ni(d.wins, 1e9), battles: ni(d.battles, 1e9), days: ni(d.days, 100000) };
+}
+
 function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); }
+
+// El otro jugador de la sala o de la partida (sirve para el chat)
+function peer(s) {
+  const L = lobbies.get(s.id);
+  if (L) return L.a.s === s ? L.b.s : L.a.s;
+  const m = matches.get(s.id);
+  return m ? (m.a === s ? m.b : m.a) : null;
+}
 
 function endMatch(s) {
   const m = matches.get(s.id);
@@ -204,40 +223,130 @@ function endMatch(s) {
   if (!m.done.has(s.id)) o.emit('oppleft');
 }
 
-function tryMatch(mode) {
-  const q = queues[mode];
+// Cierra la sala previa; si se da msg, el otro jugador lo recibe
+function lobbyEnd(s, msg) {
+  const L = lobbies.get(s.id);
+  if (!L) return;
+  clearTimeout(L.t);
+  lobbies.delete(L.a.s.id); lobbies.delete(L.b.s.id);
+  const o = L.a.s === s ? L.b.s : L.a.s;
+  if (msg) o.emit('plend', { msg });
+}
+
+function startMatch(sa, ta, sb, tb, raid) {
+  const seed = Math.floor(Math.random() * 4294967296);
+  const wx = WX[Math.floor(Math.random() * WX.length)];
+  const m = { a: sa, b: sb, t: null, got: new Set(), done: new Set() };
+  matches.set(sa.id, m); matches.set(sb.id, m);
+  // en raid, "opp" es el equipo del compañero
+  sa.emit('match', { host: true,  seed, wx, me: ta, opp: tb, raid });
+  sb.emit('match', { host: false, seed, wx, me: tb, opp: ta, raid });
+}
+
+function tryRaid() {
+  const q = queues.raid;
   while (q.length >= 2) {
     const a = q.shift(), b = q.shift();
     if (!a.s.connected) { q.unshift(b); continue; }
     if (!b.s.connected) { q.unshift(a); continue; }
-    const seed = Math.floor(Math.random() * 4294967296);
-    const wx = WX[Math.floor(Math.random() * WX.length)];
-    const m = { a: a.s, b: b.s, t: null, got: new Set(), done: new Set() };
-    matches.set(a.s.id, m); matches.set(b.s.id, m);
-    const raid = mode === 'raid';   // en raid, "opp" es el equipo del compañero
-    a.s.emit('match', { host: true,  seed, wx, me: a.team, opp: b.team, raid });
-    b.s.emit('match', { host: false, seed, wx, me: b.team, opp: a.team, raid });
+    startMatch(a.s, a.team, b.s, b.team, true);
   }
 }
 
+// --- PvP: dos jugadores se conectan, votan el modo; si difieren, ruleta entre los dos votos ---
+function tryPvp() {
+  const q = queues.pvp;
+  while (q.length >= 2) {
+    const a = q.shift(), b = q.shift();
+    if (!a.s.connected) { q.unshift(b); continue; }
+    if (!b.s.connected) { q.unshift(a); continue; }
+    const L = { a: { s: a.s, prof: a.prof, vote: 0, team: null }, b: { s: b.s, prof: b.prof, vote: 0, team: null }, phase: 'vote', mode: 0, t: null };
+    lobbies.set(a.s.id, L); lobbies.set(b.s.id, L);
+    a.s.emit('plobby', { opp: b.prof, ms: VOTE_MS });
+    b.s.emit('plobby', { opp: a.prof, ms: VOTE_MS });
+    L.t = setTimeout(() => resolveVote(L), VOTE_MS + 500);
+  }
+}
+
+function resolveVote(L) {
+  if (L.phase !== 'vote') return;
+  clearTimeout(L.t);
+  L.phase = 'spin';
+  const v = [L.a.vote, L.b.vote].filter(Boolean);
+  let opts, mode;
+  if (!v.length) { mode = 1 + Math.floor(Math.random() * 3); opts = [mode]; }          // nadie votó: al azar
+  else if (v.length === 1 || v[0] === v[1]) { mode = v[0]; opts = [mode]; }             // acuerdo, o solo votó uno
+  else { opts = Math.random() < 0.5 ? [v[0], v[1]] : [v[1], v[0]]; mode = opts[Math.floor(Math.random() * 2)]; }   // ruleta
+  L.mode = mode;
+  L.a.s.emit('pspin', { opts, mode, me: L.a.vote, opp: L.b.vote });
+  L.b.s.emit('pspin', { opts, mode, me: L.b.vote, opp: L.a.vote });
+  L.t = setTimeout(() => {
+    L.phase = 'pick';
+    L.a.s.emit('ppick', { mode, ms: PICK_MS });
+    L.b.s.emit('ppick', { mode, ms: PICK_MS });
+    L.t = setTimeout(() => {
+      if (lobbies.get(L.a.s.id) !== L) return;
+      L.a.s.emit('plend', { msg: L.a.team ? '⏰ Tu rival tardó demasiado en elegir su equipo' : '⏰ Tardaste demasiado en elegir tu equipo' });
+      L.b.s.emit('plend', { msg: L.b.team ? '⏰ Tu rival tardó demasiado en elegir su equipo' : '⏰ Tardaste demasiado en elegir tu equipo' });
+      lobbies.delete(L.a.s.id); lobbies.delete(L.b.s.id);
+    }, PICK_MS + 1500);
+  }, opts.length > 1 ? SPIN_MS : 2600);
+}
+
 io.on('connection', s => {
-  s.on('find', d => {
-    const mode = d && d.mode;
-    if (![1, 2, 3].includes(mode) || !validTeam(mode, d.team)) return s.emit('err', 'Equipo inválido');
-    endMatch(s); unqueue(s);
-    queues[mode].push({ s, team: d.team });
-    tryMatch(mode);
+  // Sala PvP: no se elige modo antes de entrar; se envía solo el perfil público
+  s.on('pvpfind', d => {
+    endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
+    queues.pvp.push({ s, prof: cleanProf(s, d && d.prof) });
+    tryPvp();
+  });
+  s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 7.0'));   // clientes viejos
+
+  s.on('pvote', d => {
+    const L = lobbies.get(s.id), mode = d && d.mode;
+    if (!L || L.phase !== 'vote' || ![1, 2, 3].includes(mode)) return;
+    const me = L.a.s === s ? L.a : L.b, o = L.a.s === s ? L.b : L.a;
+    const first = !me.vote;
+    me.vote = mode;
+    if (first) o.s.emit('pvoted');
+    if (L.a.vote && L.b.vote) resolveVote(L);
+  });
+
+  s.on('pteam', d => {
+    const L = lobbies.get(s.id);
+    if (!L || L.phase !== 'pick') return;
+    const me = L.a.s === s ? L.a : L.b, o = L.a.s === s ? L.b : L.a;
+    if (me.team) return;
+    if (!d || !validTeam(L.mode, d.team)) return s.emit('perr', 'Equipo inválido');
+    me.team = d.team;
+    o.s.emit('pready');
+    if (L.a.team && L.b.team) {
+      clearTimeout(L.t);
+      lobbies.delete(L.a.s.id); lobbies.delete(L.b.s.id);
+      startMatch(L.a.s, L.a.team, L.b.s, L.b.team, false);
+    }
+  });
+
+  // Chat entre los dos jugadores (sala previa, combate y pantalla de resultado)
+  s.on('pchat', d => {
+    const o = peer(s);
+    if (!o || !d) return;
+    const text = cleanMsg(d.text), now = Date.now();
+    if (!text || now - (s.data.pc || 0) < 700) return;      // anti-spam
+    s.data.pc = now;
+    const msg = { id: s.id, text };
+    s.emit('pchat', msg); o.emit('pchat', msg);
   });
 
   // RaidOnline: dos jugadores (2 personajes cada uno) se emparejan como compañeros
   s.on('findraid', d => {
     if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
-    endMatch(s); unqueue(s);
+    endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
     queues.raid.push({ s, team: d.team });
-    tryMatch('raid');
+    tryRaid();
   });
 
-  s.on('cancel', () => unqueue(s));
+  s.on('cancel', () => { unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
 
   // Cada turno los dos jugadores mandan sus acciones; el servidor solo las reenvía.
   s.on('plan', p => {
@@ -252,8 +361,8 @@ io.on('connection', s => {
   });
 
   s.on('done', () => { const m = matches.get(s.id); if (m) m.done.add(s.id); });
-  s.on('leave', () => endMatch(s));
-  s.on('disconnect', () => { unqueue(s); endMatch(s); });
+  s.on('leave', () => { endMatch(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
+  s.on('disconnect', () => { unqueue(s); endMatch(s); lobbyEnd(s, '🔌 Tu rival se desconectó'); });
 });
 
 // ===== Mundo abierto: jardín compartido con estanque, chat y gemas escondidas =====
