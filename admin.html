@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>MultiverZ · Admin</title>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#12121a;color:#eee;margin:0;padding:12px;max-width:960px;margin:auto}
+h2{margin:6px 0 12px}button{background:#4f46e5;color:#fff;border:0;border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
+button.g{background:#374151}button.r{background:#dc2626}button.ok{background:#16a34a}button:disabled{opacity:.5}
+input,textarea{background:#1f2030;color:#eee;border:1px solid #3b3d57;border-radius:8px;padding:8px;font-size:14px;width:100%}
+.row{display:flex;gap:8px;margin:8px 0;flex-wrap:wrap}.row>*{flex:1}.row>button{flex:none}
+.tabs button{background:#1f2030}.tabs button.on{background:#4f46e5}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 4px;border-bottom:1px solid #2a2c42;text-align:left;vertical-align:top}
+.uid{font-family:monospace;font-size:12px;cursor:pointer;color:#9ca3af;word-break:break-all}.b{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px}
+.on_{background:#16a34a}.off_{background:#4b5563}.ban_{background:#dc2626}small{color:#9ca3af}#msg{min-height:20px;color:#fbbf24;margin:6px 0}
+.tw{overflow-x:auto}
+</style></head><body>
+<h2>🛡️ MultiverZ · Panel de admin</h2>
+<div id="login"><div class="row"><input id="key" type="password" placeholder="Clave de admin (ADMIN_KEY)"><button onclick="enter()">Entrar</button></div></div>
+<div id="msg"></div>
+<div id="app" hidden>
+ <div class="row tabs"><button id="t1" class="on" onclick="tab(1)">👥 Jugadores</button><button id="t2" class="g" onclick="tab(2)">🚫 Baneados</button><button id="t3" class="g" onclick="tab(3)">💾 Respaldo</button><button class="g" style="flex:none" onclick="out()">Salir</button></div>
+ <div id="p1"><div class="row"><input id="q" placeholder="Buscar por nombre o ID" oninput="clearTimeout(window._t);window._t=setTimeout(load,300)"><button onclick="load()">↻</button></div><small id="stat"></small><div class="tw"><table><thead><tr><th>Jugador</th><th>Estado</th><th>Última vez</th><th></th></tr></thead><tbody id="tb"></tbody></table></div></div>
+ <div id="p2" hidden><div class="tw"><table><thead><tr><th>Jugador</th><th>Motivo</th><th></th></tr></thead><tbody id="tb2"></tbody></table></div><p><small id="ips"></small></p></div>
+ <div id="p3" hidden>
+  <p><small>El plan gratis de Render <b>borra el archivo de datos</b> al reiniciar o redesplegar. Para que los baneos sobrevivan, copia estas listas y pégalas como variables de entorno en Render (Environment).</small></p>
+  <label>BANNED_UIDS</label><textarea id="bu" rows="3" readonly onclick="this.select()"></textarea>
+  <label>BANNED_IPS</label><textarea id="bi" rows="2" readonly onclick="this.select()"></textarea>
+  <p><small>Restaurar desde una copia (JSON exportado):</small></p><textarea id="rs" rows="4" placeholder='{"bans":{...},"ipbans":{...}}'></textarea>
+  <div class="row"><button onclick="restore()">Restaurar baneos</button><button class="g" onclick="backup()">↻ Actualizar</button></div>
+  <label>Copia completa (JSON)</label><textarea id="bj" rows="5" readonly onclick="this.select()"></textarea>
+ </div>
+</div>
+<script>
+let K=sessionStorage.getItem('mvz_k')||'';const $=i=>document.getElementById(i);
+const say=t=>{$('msg').textContent=t||''};
+async function api(path,body){const r=await fetch('/admin/api/'+path,{method:body?'POST':'GET',headers:{'x-admin-key':K,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('Error '+r.status));return j}
+async function enter(){K=$('key').value||K;try{await api('players');sessionStorage.setItem('mvz_k',K);$('login').hidden=true;$('app').hidden=false;say('');load()}catch(e){say(e.message);K=''}}
+function out(){sessionStorage.removeItem('mvz_k');K='';$('app').hidden=true;$('login').hidden=false;$('key').value=''}
+function tab(n){[1,2,3].forEach(i=>{$('p'+i).hidden=i!=n;$('t'+i).className=i==n?'on':'g'});say('');if(n==1)load();if(n==2)bans();if(n==3)backup()}
+const ago=t=>{const s=Math.max(0,(Date.now()-t)/1000);return s<90?'ahora':s<5400?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' días'};
+function cell(tr,txt,cls){const td=document.createElement('td');if(cls)td.className=cls;td.textContent=txt;tr.appendChild(td);return td}
+function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);say('ID copiado')}
+async function load(){try{const j=await api('players?q='+encodeURIComponent($('q').value||''));$('stat').textContent=j.total+' cuentas registradas · '+j.online+' conectadas ahora';const tb=$('tb');tb.innerHTML='';
+ j.list.forEach(p=>{const tr=document.createElement('tr');const td=cell(tr,p.name);td.appendChild(document.createElement('br'));const u=document.createElement('span');u.className='uid';u.textContent=p.uid;u.onclick=()=>copy(p.uid);td.appendChild(u);
+  const st=cell(tr,'');const b=document.createElement('span');b.className='b '+(p.banned?'ban_':p.online?'on_':'off_');b.textContent=p.banned?'baneado':p.online?'online':'offline';st.appendChild(b);if(p.banned&&p.reason){st.appendChild(document.createElement('br'));const s=document.createElement('small');s.textContent=p.reason;st.appendChild(s)}
+  cell(tr,ago(p.last));const ac=document.createElement('td');const bt=document.createElement('button');
+  if(p.banned){bt.textContent='Desbanear';bt.className='ok';bt.onclick=()=>unban(p.uid)}else{bt.textContent='Banear';bt.className='r';bt.onclick=()=>ban(p)}ac.appendChild(bt);
+  if(!p.banned){const gb=document.createElement('button');gb.textContent='🎁 Dar';gb.className='ok';gb.style.marginLeft='6px';gb.onclick=()=>gift(p);ac.appendChild(gb);if(p.gifts){const pg=document.createElement('small');pg.textContent=' ('+p.gifts+' pend.)';ac.appendChild(pg)}}
+  tr.appendChild(ac);tb.appendChild(tr)})}catch(e){say(e.message)}}
+async function ban(p){const r=prompt('Motivo del baneo para "'+p.name+'" (lo verá el jugador):','Trampas');if(r===null)return;const ip=p.ips&&p.ips.length?confirm('¿Bloquear también sus IPs ('+p.ips.join(', ')+')?\nOjo: puede afectar a otras personas de la misma red. Cancelar = solo la cuenta.'):false;
+ try{const j=await api('ban',{uid:p.uid,reason:r,ip});say('Baneado. Sesiones expulsadas: '+j.kicked);load()}catch(e){say(e.message)}}
+async function gift(p){const g=prompt('Gemas para "'+p.name+'" (0 si solo tickets):','500');if(g===null)return;const t=prompt('Tickets (0 si ninguno):','0');if(t===null)return;const m=prompt('Mensaje para el jugador (opcional):','');if(m===null)return;
+ try{const j=await api('gift',{uid:p.uid,gems:+g||0,tk:+t||0,msg:m});say(j.delivered?'🎁 Entregado: el jugador está conectado y ya lo recibe':'🎁 Guardado: lo recibirá la próxima vez que se conecte');load()}catch(e){say(e.message)}}
+async function unban(uid){if(!confirm('¿Desbanear esta cuenta?'))return;try{const j=await api('unban',{uid});say(j.env?'Quitado del archivo, pero sigue en la variable BANNED_UIDS de Render: bórralo también allí':'Desbaneado');load();bans()}catch(e){say(e.message)}}
+async function bans(){try{const j=await api('bans');const tb=$('tb2');tb.innerHTML='';j.list.forEach(b=>{const tr=document.createElement('tr');const td=cell(tr,b.name+(b.env?' (permanente)':''));td.appendChild(document.createElement('br'));const u=document.createElement('span');u.className='uid';u.textContent=b.uid;u.onclick=()=>copy(b.uid);td.appendChild(u);cell(tr,b.reason||'');const ac=document.createElement('td');const bt=document.createElement('button');bt.className='ok';bt.textContent='Desbanear';bt.onclick=()=>unban(b.uid);ac.appendChild(bt);tr.appendChild(ac);tb.appendChild(tr)});
+ $('ips').textContent=(j.ips.length+j.envIps.length)?'IPs bloqueadas: '+[...j.ips,...j.envIps].join(', '):'Sin IPs bloqueadas'}catch(e){say(e.message)}}
+async function backup(){try{const j=await api('backup');$('bu').value=j.BANNED_UIDS;$('bi').value=j.BANNED_IPS;$('bj').value=JSON.stringify({bans:j.bans,ipbans:j.ipbans})}catch(e){say(e.message)}}
+async function restore(){let o;try{o=JSON.parse($('rs').value)}catch(e){return say('JSON inválido')}try{const j=await api('restore',o);say('Restaurados: '+j.added+' baneos nuevos');$('rs').value='';backup()}catch(e){say(e.message)}}
+$('key').addEventListener('keydown',e=>{if(e.key=='Enter')enter()});if(K){$('key').value=K;enter()}
+</script></body></html>
