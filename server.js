@@ -5,11 +5,182 @@ const path = require('path');
 const { Server } = require('socket.io');
 
 const app = express();
-const server = http.createServer(app);
+const server = http.createServer((req, res) => (req.url.startsWith('/api/') ? apiHandler(req, res) : app(req, res)));
 const io = new Server(server, { cors: { origin: '*' } });
 
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
+
+// =====================================================================
+//  CUENTAS GUARDADAS EN EL SERVIDOR
+//  Las cuentas viven FUERA del código, así que sobreviven a las
+//  actualizaciones del juego y del servidor. Dónde se guardan:
+//   1) Upstash Redis (gratis, recomendado en Render gratis):
+//        UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN
+//   2) Archivo accounts.json en DATA_DIR (por defecto ./data).
+//        En Render hay que montar un Disk y poner DATA_DIR=/var/data;
+//        sin Disk, el plan gratis borra los archivos al reiniciar.
+//  Admin: define ADMIN_KEY (clave secreta) para ver las cuentas.
+// =====================================================================
+const fs = require('fs');
+const crypto = require('crypto');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const UP_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const accBackend = UP_URL && UP_TOKEN ? 'redis' : 'file';
+const accs = new Map();                 // usuario en minúsculas -> cuenta
+let accReady = false;
+
+async function redis(cmds) {            // pipeline de Upstash: [['SET','k','v'], ...]
+  const r = await fetch(UP_URL + '/pipeline', { method: 'POST', headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(cmds) });
+  if (!r.ok) throw new Error('redis ' + r.status);
+  return (await r.json()).map(x => { if (x.error) throw new Error(x.error); return x.result; });
+}
+
+async function accInit() {
+  accs.clear();
+  if (accBackend === 'redis') {
+    const [names] = await redis([['SMEMBERS', 'mz:accs']]);
+    if (names.length) (await redis(names.map(n => ['GET', 'mz:acc:' + n]))).forEach(v => { if (v) { const a = JSON.parse(v); accs.set(a.key, a); } });
+  } else {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    for (const f of [ACC_FILE, ACC_FILE + '.bak']) {
+      try { JSON.parse(fs.readFileSync(f, 'utf8')).forEach(a => accs.set(a.key, a)); break; }
+      catch (e) { if (e.code !== 'ENOENT') console.warn('No se pudo leer ' + f + ': ' + e.message); }
+    }
+  }
+  accReady = true;
+  console.log('Cuentas cargadas: ' + accs.size + ' (almacenamiento: ' + (accBackend === 'redis' ? 'Upstash Redis' : ACC_FILE) + ')');
+  if (accBackend === 'file') console.log('⚠️  Cuentas en archivo: si tu hosting borra el disco al reiniciar (Render gratis), usa Upstash Redis o un Disk con DATA_DIR.');
+  if (!ADMIN_KEY) console.log('ℹ️  Sin ADMIN_KEY: la vista de admin está desactivada.');
+}
+(function startAcc() { accInit().catch(e => { console.error('Cuentas: no se pudo cargar (' + e.message + '), reintentando…'); setTimeout(startAcc, 5000); }); })();
+
+let wTimer = null, wBusy = false, wAgain = false;
+function fileFlush() {
+  if (wBusy) { wAgain = true; return; }
+  wBusy = true;
+  const tmp = ACC_FILE + '.tmp';
+  fs.writeFile(tmp, JSON.stringify([...accs.values()]), err => {
+    if (err) { console.error('No se pudo guardar cuentas:', err.message); wBusy = false; return; }
+    fs.copyFile(ACC_FILE, ACC_FILE + '.bak', () => fs.rename(tmp, ACC_FILE, err2 => {
+      wBusy = false; if (err2) console.error('No se pudo guardar cuentas:', err2.message);
+      if (wAgain) { wAgain = false; fileFlush(); }
+    }));
+  });
+}
+function accPersist(a) {
+  if (accBackend === 'redis') return redis([['SET', 'mz:acc:' + a.key, JSON.stringify(a)], ['SADD', 'mz:accs', a.key]]);
+  clearTimeout(wTimer); wTimer = setTimeout(fileFlush, 300);
+  return Promise.resolve();
+}
+['SIGTERM', 'SIGINT'].forEach(sig => process.on(sig, () => {     // al apagar/redesplegar no se pierde lo pendiente
+  if (accBackend === 'file' && accReady) { try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(ACC_FILE, JSON.stringify([...accs.values()])); } catch (e) {} }
+  process.exit(0);
+}));
+
+const scrypt = (p, s) => new Promise((ok, no) => crypto.scrypt(p, s, 32, (e, k) => (e ? no(e) : ok(k))));
+const sha = v => crypto.createHash('sha256').update(String(v)).digest('hex');
+async function mkPass(pass) { const salt = crypto.randomBytes(16); return { salt: salt.toString('hex'), hash: (await scrypt(pass, salt)).toString('hex') }; }
+async function checkPass(a, pass) { const h = await scrypt(pass, Buffer.from(a.salt, 'hex')), b = Buffer.from(a.hash, 'hex'); return b.length === h.length && crypto.timingSafeEqual(h, b); }
+function newToken(a) { const t = crypto.randomBytes(24).toString('hex'); a.tokens.push(sha(t)); while (a.tokens.length > 5) a.tokens.shift(); return t; }
+const authTok = (a, t) => !!a && typeof t === 'string' && a.tokens.includes(sha(t));
+function metaOf(str) {
+  const S = JSON.parse(str);
+  if (!S || typeof S !== 'object' || Array.isArray(S)) throw new Error('save');
+  return { disp: String(S.name || '').slice(0, 24), gems: Number(S.gems) || 0, chars: S.o && typeof S.o === 'object' ? Object.keys(S.o).length : 0, wins: Number(S.wins) || 0 };
+}
+
+const rl = new Map();                                   // límites de intentos
+const tooMany = (k, max, ms) => { const e = rl.get(k); return !!e && Date.now() - e.t < ms && e.n >= max; };
+const hit = (k, ms) => { const e = rl.get(k); if (!e || Date.now() - e.t >= ms) rl.set(k, { n: 1, t: Date.now() }); else e.n++; };
+setInterval(() => { const n = Date.now(); for (const [k, e] of rl) if (n - e.t > 3600000) rl.delete(k); }, 600000);
+
+function readBody(req, max = 600000) {
+  return new Promise((ok, no) => {
+    let n = 0; const c = [];
+    req.on('data', d => { n += d.length; if (n > max) { no(new Error('big')); req.destroy(); } else c.push(d); });
+    req.on('end', () => { try { ok(JSON.parse(Buffer.concat(c).toString() || '{}')); } catch (e) { no(new Error('json')); } });
+    req.on('error', no);
+  });
+}
+
+async function apiHandler(req, res) {
+  const H = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Cache-Control': 'no-store' };
+  const send = (code, obj) => { res.writeHead(code, H); res.end(JSON.stringify(obj)); };
+  if (req.method === 'OPTIONS') { res.writeHead(204, H); return res.end(); }
+  if (req.method !== 'POST') return send(405, { error: 'método no permitido' });
+  if (!accReady) return send(503, { error: 'El servidor está arrancando, prueba en unos segundos' });
+  let d;
+  try { d = await readBody(req); } catch (e) { return send(400, { error: 'petición inválida' }); }
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const route = req.url.split('?')[0].replace('/api/', '');
+  const dev = String(d.dev || '').slice(0, 40);
+  try {
+    if (route === 'register') {
+      const name = String(d.name || '').trim(), pass = String(d.pass || ''), key = name.toLowerCase();
+      if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) return send(400, { error: 'El usuario debe tener 3-16 letras, números o _' });
+      if (pass.length < 6 || pass.length > 64) return send(400, { error: 'La contraseña debe tener entre 6 y 64 caracteres' });
+      if (accs.has(key)) return send(409, { error: 'Ese usuario ya existe' });
+      if (tooMany('reg|' + ip, 10, 3600000)) return send(429, { error: 'Demasiadas cuentas creadas desde aquí, prueba más tarde' });
+      let save = null, meta = { disp: '', gems: 0, chars: 0, wins: 0 };
+      if (typeof d.save === 'string' && d.save) {
+        if (d.save.length > 400000) return send(400, { error: 'La partida es demasiado grande' });
+        try { meta = metaOf(d.save); save = d.save; } catch (e) { return send(400, { error: 'Partida inválida' }); }
+      }
+      const pw = await mkPass(pass);
+      if (accs.has(key)) return send(409, { error: 'Ese usuario ya existe' });
+      const a = { name, key, salt: pw.salt, hash: pw.hash, tokens: [], created: Date.now(), last: Date.now(), saved: save ? Date.now() : 0, v: save ? 1 : 0, dev, meta, save };
+      const token = newToken(a);
+      accs.set(key, a);
+      hit('reg|' + ip, 3600000);
+      await accPersist(a);
+      return send(200, { ok: true, token, v: a.v, name: a.name });
+    }
+    if (route === 'login') {
+      const key = String(d.name || '').trim().toLowerCase(), rk = 'login|' + ip + '|' + key;
+      if (tooMany(rk, 8, 600000)) return send(429, { error: 'Demasiados intentos, espera unos minutos' });
+      const a = accs.get(key);
+      if (!a || !(await checkPass(a, String(d.pass || '')))) { hit(rk, 600000); return send(401, { error: 'Usuario o contraseña incorrectos' }); }
+      a.last = Date.now();
+      const token = newToken(a);
+      await accPersist(a);
+      return send(200, { ok: true, token, v: a.v, name: a.name, save: a.save, saved: a.saved });
+    }
+    if (route === 'save' || route === 'load' || route === 'logout') {
+      const a = accs.get(String(d.name || '').trim().toLowerCase());
+      if (!authTok(a, d.token)) return send(401, { error: 'Sesión caducada, vuelve a entrar' });
+      if (route === 'logout') { const h = sha(d.token); a.tokens = a.tokens.filter(x => x !== h); await accPersist(a); return send(200, { ok: true }); }
+      if (route === 'load') return send(200, { ok: true, v: a.v, save: a.save, saved: a.saved });
+      if (typeof d.save !== 'string' || !d.save || d.save.length > 400000) return send(400, { error: 'Partida inválida o demasiado grande' });
+      // Si otro dispositivo guardó después de la última vez que este sincronizó, no se pisa en silencio
+      if (!d.force && dev !== a.dev && Number(d.base) !== a.v) return send(409, { stale: true, v: a.v, saved: a.saved, error: 'La cuenta se guardó desde otro dispositivo' });
+      let meta; try { meta = metaOf(d.save); } catch (e) { return send(400, { error: 'Partida inválida' }); }
+      a.save = d.save; a.meta = meta; a.v++; a.saved = Date.now(); a.dev = dev;
+      await accPersist(a);
+      return send(200, { ok: true, v: a.v, saved: a.saved });
+    }
+    if (route === 'admin/list' || route === 'admin/reset') {
+      if (!ADMIN_KEY) return send(403, { error: 'Admin desactivado: define ADMIN_KEY en el servidor' });
+      if (tooMany('adm|' + ip, 5, 600000)) return send(429, { error: 'Demasiados intentos, espera unos minutos' });
+      const kb = Buffer.from(sha(d.key), 'hex'), ab = Buffer.from(sha(ADMIN_KEY), 'hex');
+      if (!crypto.timingSafeEqual(kb, ab)) { hit('adm|' + ip, 600000); return send(403, { error: 'Clave de admin incorrecta' }); }
+      if (route === 'admin/list') {
+        const list = [...accs.values()].sort((x, y) => y.created - x.created).map(a => ({ name: a.name, disp: a.meta.disp, created: a.created, last: a.last, saved: a.saved, v: a.v, gems: a.meta.gems, chars: a.meta.chars, wins: a.meta.wins, devices: a.tokens.length }));
+        return send(200, { ok: true, total: list.length, store: accBackend, accounts: list });
+      }
+      const a = accs.get(String(d.name || '').trim().toLowerCase()), pass = String(d.pass || '');
+      if (!a) return send(404, { error: 'No existe esa cuenta' });
+      if (pass.length < 6 || pass.length > 64) return send(400, { error: 'La contraseña debe tener entre 6 y 64 caracteres' });
+      const pw = await mkPass(pass); a.salt = pw.salt; a.hash = pw.hash; a.tokens = [];   // cierra sus sesiones
+      await accPersist(a);
+      return send(200, { ok: true });
+    }
+    return send(404, { error: 'ruta desconocida' });
+  } catch (e) { console.error('API ' + route + ':', e); return send(500, { error: 'Error del servidor, inténtalo de nuevo' }); }
+}
 
 const MAX_ID = 80;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
