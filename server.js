@@ -160,6 +160,19 @@ app.post('/admin/api/gift', adminAuth, (req, res) => {          // regalar gemas
   for (const s of [...(online.get(uid) || [])]) { s.emit('gifts', list); sent++; }
   res.json({ ok: true, delivered: sent > 0 });
 });
+app.post('/admin/api/setgems', adminAuth, (req, res) => {       // fijar las gemas de una cuenta a una cantidad exacta
+  const b = req.body || {}, uid = cid(b.uid), n = Math.floor(Number(b.gems));
+  if (!db.players[uid]) return res.status(404).json({ error: 'Esa cuenta no está registrada' });
+  if (!Number.isFinite(n) || n < 0 || n > 1e9) return res.status(400).json({ error: 'Cantidad inválida (0 a 1000000000)' });
+  const list = db.gifts[uid] = db.gifts[uid] || [];
+  for (let i = list.length - 1; i >= 0; i--) if (list[i].sg !== undefined) list.splice(i, 1);   // solo vale el último "fijar"
+  if (list.length >= 20) return res.status(400).json({ error: 'Ya tiene 20 regalos pendientes' });
+  list.push({ id: crypto.randomBytes(6).toString('hex'), sg: n, gems: 0, tk: 0, msg: clean(b.msg, 80), at: Date.now() });
+  save();
+  let sent = 0;
+  for (const s of [...(online.get(uid) || [])]) { s.emit('gifts', list); sent++; }
+  res.json({ ok: true, delivered: sent > 0 });
+});
 app.get('/admin/api/backup', adminAuth, (_, res) => {
   const uids = [...new Set([...Object.keys(db.bans), ...envBans])], ips = [...new Set([...Object.keys(db.ipbans), ...envIps])];
   res.json({ bans: db.bans, ipbans: db.ipbans, BANNED_UIDS: uids.join(','), BANNED_IPS: ips.join(',') });
