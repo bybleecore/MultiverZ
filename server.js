@@ -24,10 +24,10 @@ const cid = v => String(v || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
 const clean = (v, n) => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, n);
 const sha = v => crypto.createHash('sha256').update(String(v)).digest('hex');
 const firstIp = h => String((h && h['x-forwarded-for']) || '').split(',')[0].trim();
-let db = { players: {}, bans: {}, ipbans: {}, gifts: {} };
+let db = { players: {}, bans: {}, ipbans: {}, gifts: {}, crews: {}, trd: {} };
 try {
   const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {} };
+  db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {}, crews: d.crews || {}, trd: d.trd || {} };
   console.log('Datos cargados: ' + Object.keys(db.players).length + ' jugadores, ' + Object.keys(db.bans).length + ' baneados');
 } catch (e) { console.log('Sin archivo de datos previo: se creará uno nuevo en ' + DATA_FILE); }
 const envBans = new Set((process.env.BANNED_UIDS || '').split(',').map(cid).filter(Boolean));
@@ -51,7 +51,7 @@ function noteStats(p, d) {
   if (!p || !d || typeof d !== 'object' || d.gems === undefined) return;
   const n = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0)), now = Date.now(), g = n(d.gems, 1e9);
   const changed = p.gems !== g;
-  p.gems = g; p.chars = n(d.chars, 1000); p.wins = n(d.wins, 1e9); p.battles = n(d.battles, 1e9); p.days = n(d.days, 100000); p.gt = now;
+  p.gems = g; if (d.av !== undefined) p.av = n(d.av, 1000); p.chars = n(d.chars, 1000); p.wins = n(d.wins, 1e9); p.battles = n(d.battles, 1e9); p.days = n(d.days, 100000); p.gt = now;
   if (changed && now - lastStatSave > 20000) { lastStatSave = now; save(); }      // no escribir el archivo en cada reporte
 }
 const sockIp = s => firstIp(s.handshake.headers) || s.handshake.address || '';
@@ -688,6 +688,126 @@ setInterval(() => {
   io.to('world').emit('wpos', ch.map(p => [p.id, Math.round(p.x), Math.round(p.y)]));
   ch.forEach(p => { p.dirty = false; });
 }, 80);
+
+/* ===== Crews (clanes): miembros, chat e intercambio ===== */
+const CREW_MAX = 20, CREW_LOG = 40, TR_CAP = { c: 3 }, TR_PER_HOUR = 10;
+const crewOf = uid => { const p = db.players[uid]; return p && p.crew && db.crews[p.crew] ? db.crews[p.crew] : null; };
+const crSocks = uid => [...(online.get(uid) || [])];
+const crView = c => ({ id: c.id, name: c.name, leader: c.leader, max: CREW_MAX,
+  members: c.members.map(u => { const p = db.players[u] || {}; return { uid: u, name: p.name || 'Jugador', av: p.av || 0, on: online.has(u) }; }) });
+function crToAll(c, ev, data) { for (const u of c.members) for (const s of crSocks(u)) s.emit(ev, data); }
+function crPush(c, withLog) { crToAll(c, 'crstate', withLog ? { c: crView(c), log: c.log } : { c: crView(c) }); }
+function crSys(c, text) { const m = { n: '', x: text, t: Date.now(), s: 1 }; c.log.push(m); if (c.log.length > CREW_LOG) c.log.shift(); crToAll(c, 'crmsg', m); }
+const cleanCards = a => [...new Set((Array.isArray(a) ? a : []).slice(0, 10).map(x => ni(x, MAX_ID)).filter(x => x >= 1))].slice(0, TR_CAP.c);
+const trades = new Map(), tradeOf = new Map();            // intercambios en curso (solo en memoria)
+function tView(tr, uid) {
+  const me = tr.a === uid ? 'a' : 'b', ot = me === 'a' ? 'b' : 'a', op = db.players[tr[ot]] || {};
+  return { id: tr.id, with: { uid: tr[ot], name: op.name || 'Jugador' }, mine: tr.of[me], theirs: tr.of[ot], mok: tr.ok[me], tok: tr.ok[ot], cap: TR_CAP };
+}
+function tPush(tr) { for (const u of [tr.a, tr.b]) for (const s of crSocks(u)) s.emit('crt', tView(tr, u)); }
+function tEnd(tr, reason) {
+  trades.delete(tr.id); tradeOf.delete(tr.a); tradeOf.delete(tr.b);
+  for (const u of [tr.a, tr.b]) for (const s of crSocks(u)) s.emit('crtend', { id: tr.id, reason });
+}
+function tCancelUid(uid, reason) { const id = tradeOf.get(uid), tr = id && trades.get(id); if (tr) tEnd(tr, reason); }
+function crRemove(uid, reason) {                           // sacar a un jugador de su crew (salió o lo expulsaron)
+  const c = crewOf(uid), p = db.players[uid]; if (!c || !p) return;
+  tCancelUid(uid, 'Se canceló el intercambio');
+  c.members = c.members.filter(u => u !== uid); delete p.crew;
+  for (const s of crSocks(uid)) s.emit('crstate', { c: null, log: [] });
+  if (!c.members.length) delete db.crews[c.id];
+  else { if (c.leader === uid) c.leader = c.members[0]; crSys(c, '👋 ' + (p.name || 'Jugador') + ' ' + reason); crPush(c); }
+  save();
+}
+io.on('connection', s => {
+  const uid = s.data.uid;
+  const c0 = crewOf(uid); if (c0) setTimeout(() => crPush(c0), 200);     // avisa a la crew que este miembro está en línea
+  if (db.trd[uid] && db.trd[uid].length) s.emit('crsettle', db.trd[uid]);   // intercambios que aún no cobró
+  const lastAt = {}; const rate = (k, ms) => { const n = Date.now(); if (n - (lastAt[k] || 0) < ms) return false; lastAt[k] = n; return true; };
+  s.on('crme', () => { const c = crewOf(uid); s.emit('crstate', { c: c ? crView(c) : null, log: c ? c.log : [] });
+    const id = tradeOf.get(uid), tr = id && trades.get(id); if (tr) s.emit('crt', tView(tr, uid)); });
+  s.on('crlist', () => s.emit('crlistr', Object.values(db.crews).sort((a, b) => b.members.length - a.members.length).slice(0, 40)
+    .map(c => ({ id: c.id, name: c.name, n: c.members.length, max: CREW_MAX, lname: (db.players[c.leader] || {}).name || '' }))));
+  s.on('crnew', d => {
+    if (!rate('new', 800)) return;
+    if (crewOf(uid)) return s.emit('crerr', 'Ya estás en una Crew');
+    const name = clean(d && d.name, 16).replace(/\s+/g, ' ');
+    if (name.length < 3) return s.emit('crerr', 'El nombre debe tener al menos 3 letras');
+    if (Object.values(db.crews).some(c => c.name.toLowerCase() === name.toLowerCase())) return s.emit('crerr', 'Ya existe una Crew con ese nombre');
+    if (Object.keys(db.crews).length >= 1000) return s.emit('crerr', 'Ya no caben más Crews');
+    const id = crypto.randomBytes(5).toString('hex');
+    const c = db.crews[id] = { id, name, leader: uid, members: [uid], log: [], at: Date.now() };
+    db.players[uid].crew = id; crSys(c, '🎉 ' + db.players[uid].name + ' creó la Crew'); crPush(c, true); save();
+  });
+  s.on('crjoin', d => {
+    if (!rate('join', 800)) return;
+    if (crewOf(uid)) return s.emit('crerr', 'Ya estás en una Crew');
+    const c = db.crews[cid(d && d.id)];
+    if (!c) return s.emit('crerr', 'Esa Crew ya no existe');
+    if (c.members.length >= CREW_MAX) return s.emit('crerr', 'La Crew está llena');
+    c.members.push(uid); db.players[uid].crew = c.id; crSys(c, '👋 ' + db.players[uid].name + ' se unió'); crPush(c, true); save();
+  });
+  s.on('crleave', () => crRemove(uid, 'salió de la Crew'));
+  s.on('crkick', d => {
+    const c = crewOf(uid), t = cid(d && d.uid);
+    if (!c || c.leader !== uid || t === uid || !c.members.includes(t)) return;
+    crRemove(t, 'fue expulsado de la Crew');
+    for (const k of crSocks(t)) k.emit('crerr', 'Te expulsaron de la Crew');
+  });
+  s.on('crchat', d => {
+    const c = crewOf(uid); if (!c || !rate('chat', 700)) return;
+    const x = String((d && d.msg) || '').replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 200); if (!x) return;
+    const m = { u: uid, n: db.players[uid].name, x, t: Date.now() };
+    c.log.push(m); if (c.log.length > CREW_LOG) c.log.shift(); crToAll(c, 'crmsg', m); save();
+  });
+  /* intercambio de CARTAS (sin gemas): los dos ofrecen y los dos aceptan; el servidor guarda el resultado hasta que cada uno lo cobra */
+  s.on('crtstart', d => {
+    if (!rate('ts', 500)) return;
+    const c = crewOf(uid), to = cid(d && d.uid);
+    if (!c || to === uid || !c.members.includes(to)) return s.emit('crerr', 'Solo puedes intercambiar con miembros de tu Crew');
+    if (!online.has(to)) return s.emit('crerr', 'Ese miembro no está conectado');
+    if (tradeOf.has(uid) || tradeOf.has(to)) return s.emit('crerr', 'Uno de los dos ya está en un intercambio');
+    const tr = { id: crypto.randomBytes(5).toString('hex'), a: uid, b: to, of: { a: { c: [] }, b: { c: [] } }, ok: { a: false, b: false } };
+    trades.set(tr.id, tr); tradeOf.set(uid, tr.id); tradeOf.set(to, tr.id); tPush(tr);
+  });
+  const myTrade = d => { const tr = trades.get(String((d && d.id) || '')); return tr && (tr.a === uid || tr.b === uid) ? tr : null; };
+  s.on('crtoffer', d => {
+    const tr = myTrade(d); if (!tr) return;
+    const me = tr.a === uid ? 'a' : 'b';
+    tr.of[me] = { c: cleanCards(d.c) }; tr.ok.a = tr.ok.b = false; tPush(tr);
+  });
+  s.on('crtok', d => {
+    const tr = myTrade(d); if (!tr) return;
+    const me = tr.a === uid ? 'a' : 'b', ot = me === 'a' ? 'b' : 'a';
+    tr.ok[me] = true;
+    if (!(tr.ok.a && tr.ok.b)) return tPush(tr);
+    const sum = x => x.c.length;
+    if (!sum(tr.of.a) && !sum(tr.of.b)) { tr.ok.a = tr.ok.b = false; tPush(tr); return s.emit('crerr', 'Nadie ofreció nada'); }
+    const now = Date.now();
+    for (const u of [tr.a, tr.b]) { const p = db.players[u]; p.tl = (p.tl || []).filter(x => now - x < 3600000); if (p.tl.length >= TR_PER_HOUR) { tr.ok.a = tr.ok.b = false; tPush(tr); return s.emit('crerr', 'Límite de intercambios por hora alcanzado (alguno de los dos)'); } }
+    for (const u of [tr.a, tr.b]) {                          // cada uno pierde lo que ofrece y recibe lo del otro
+      const k = u === tr.a ? 'a' : 'b', o = k === 'a' ? 'b' : 'a', p = db.players[u];
+      p.tl.push(now);
+      (db.trd[u] = db.trd[u] || []).push({ id: tr.id, give: tr.of[k].c, get: tr.of[o].c });
+    }
+    const c = crewOf(uid);
+    trades.delete(tr.id); tradeOf.delete(tr.a); tradeOf.delete(tr.b); save();
+    for (const u of [tr.a, tr.b]) { const ss = crSocks(u); if (ss[0]) ss[0].emit('crsettle', db.trd[u]); for (const k of ss) k.emit('crtend', { id: tr.id, reason: 'done' }); }
+    if (c) crSys(c, '🔄 ' + db.players[tr.a].name + ' y ' + db.players[tr.b].name + ' hicieron un intercambio');
+  });
+  s.on('crtcancel', d => { const tr = myTrade(d); if (tr) tEnd(tr, '❌ ' + (db.players[uid].name || 'El otro jugador') + ' rechazó el intercambio'); });
+  s.on('crack', ids => {                                     // el jugador ya aplicó el resultado de sus intercambios
+    if (!Array.isArray(ids) || !db.trd[uid]) return;
+    const ok = new Set(ids.slice(0, 50).map(x => String(x)));
+    db.trd[uid] = db.trd[uid].filter(g => !ok.has(g.id));
+    if (!db.trd[uid].length) delete db.trd[uid];
+    save();
+  });
+  s.on('disconnect', () => setTimeout(() => {
+    if (!online.has(uid)) tCancelUid(uid, '🔌 El otro jugador se desconectó');
+    const c = crewOf(uid); if (c) crPush(c);
+  }, 400));
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('MultiverZ PvP en puerto ' + PORT));
