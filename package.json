@@ -1,6 +1,6 @@
 {
   "name": "multiverz-pvp",
-  "version": "6.3.0",
+  "version": "8.0.0",
   "description": "Servidor online de MultiverZ (PvP, RaidOnline, Mundo abierto y baneos)",
   "main": "server.js",
   "scripts": { "start": "node server.js" },

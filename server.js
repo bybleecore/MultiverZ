@@ -1,4 +1,4 @@
-// Servidor de MultiverZ 7.0: PvP con votación de modo, chat, Raid, mundo abierto, cuentas y baneos
+// Servidor de MultiverZ 8.0: PvP con votación de modo, chat, Raid, mundo abierto, cuentas y baneos
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -346,7 +346,7 @@ io.on('connection', s => {
     queues.pvp.push({ s, prof: cleanProf(s, d && d.prof) });
     tryPvp();
   });
-  s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 7.0'));   // clientes viejos
+  s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 8.0'));   // clientes viejos
 
   s.on('pvote', d => {
     const L = lobbies.get(s.id), mode = d && d.mode;
