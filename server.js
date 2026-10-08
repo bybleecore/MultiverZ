@@ -230,7 +230,7 @@ app.get('/health', (_, res) => res.send('ok'));
 
 const MAX_ID = 90;                 // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
-const queues = { pvp: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
+const queues = { pvp: [], rank: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida en curso
 const lobbies = new Map();         // socket.id -> sala previa (votación -> ruleta -> elegir equipo)
 const VOTE_MS = 20000, SPIN_MS = 5200, PICK_MS = 45000;
@@ -243,11 +243,42 @@ const validTeam = (mode, t) =>
 
 const ni = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0));
 // Perfil visible para el rival. Nombre = el registrado en el servidor; el resto lo informa el juego del jugador.
+// ===== Ranking de victorias de Rankeds =====
+// Cada victoria ranked cuenta en el servidor (una por partida, y se cuenta aunque el rival se desconecte).
+// Como el combate se calcula en los juegos de los jugadores, no es un dato 100% verificable. Un empate en el 1er lugar: todos los empatados son dorados.
+function rkRows() {
+  const all = Object.entries(db.players).filter(([u, p]) => (p.pw || 0) > 0 && !banInfo(u))
+    .map(([u, p]) => ({ u, name: p.name, av: p.av || 0, pw: p.pw, t: p.pwt || 0 }))
+    .sort((a, b) => b.pw - a.pw || a.t - b.t);
+  all.forEach((x, i) => { x.pos = i && x.pw === all[i - 1].pw ? all[i - 1].pos : i + 1; });
+  return all;
+}
+let _ld = null, _ldT = 0;
+function leaders() {                                                    // uids con el nombre dorado (los que van primero, empatados incluidos)
+  const now = Date.now();
+  if (_ld && now - _ldT < 5000) return _ld;
+  const all = rkRows();
+  _ld = new Set(all.filter(x => x.pos === 1).map(x => x.u)); _ldT = now;
+  return _ld;
+}
+function rkBoard(uid) {
+  const all = rkRows(), mine = all.find(x => x.u === uid);
+  return { total: all.length, me: mine ? { pos: mine.pos, pw: mine.pw } : null,
+           list: all.slice(0, 25).map(x => ({ pos: x.pos, name: x.name, av: x.av, pw: x.pw, gold: x.pos === 1, me: x.u === uid })) };
+}
+function rkCredit(s) {                                                  // suma una victoria ranked a este jugador
+  const p = db.players[s.data.uid], now = Date.now();
+  if (!p || now - (s.data.lw || 0) < 15000) return false;               // anti-abuso: una victoria cada 15 s como mucho
+  s.data.lw = now; p.pw = (p.pw || 0) + 1; p.pwt = now; _ld = null; save();
+  return true;
+}
+
 function cleanProf(s, d) {
   d = d || {};
   const p = db.players[s.data.uid];
   return { name: (p && p.name) || 'Jugador', av: ni(d.av, MAX_ID), gems: ni(d.gems, 1e9), chars: ni(d.chars, MAX_ID),
-           wins: ni(d.wins, 1e9), battles: ni(d.battles, 1e9), days: ni(d.days, 100000) };
+           wins: ni(d.wins, 1e9), rk: d.rk == null ? null : ni(d.rk, 10), pw: ni(d.pw, 1e9), battles: ni(d.battles, 1e9), days: ni(d.days, 100000),
+           gold: leaders().has(s.data.uid) };
 }
 
 function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); }
@@ -266,6 +297,7 @@ function endMatch(s) {
   const o = m.a === s ? m.b : m.a;
   clearTimeout(m.t);
   matches.delete(m.a.id); matches.delete(m.b.id);
+  if (m.rank && !m.won && !m.done.has(s.id) && !m.done.has(o.id)) { m.won = o.id; rkCredit(o); }   // el rival abandonó la ranked: victoria para quien se quedó
   if (!m.done.has(s.id)) o.emit('oppleft');
 }
 
@@ -279,10 +311,10 @@ function lobbyEnd(s, msg) {
   if (msg) o.emit('plend', { msg });
 }
 
-function startMatch(sa, ta, sb, tb, raid) {
+function startMatch(sa, ta, sb, tb, raid, rank) {
   const seed = Math.floor(Math.random() * 4294967296);
   const wx = WX[Math.floor(Math.random() * WX.length)];
-  const m = { a: sa, b: sb, t: null, got: new Set(), done: new Set() };
+  const m = { a: sa, b: sb, t: null, got: new Set(), done: new Set(), rank: !!rank && !raid, won: 0 };
   matches.set(sa.id, m); matches.set(sb.id, m);
   // en raid, "opp" es el equipo del compañero
   sa.emit('match', { host: true,  seed, wx, me: ta, opp: tb, raid });
@@ -299,20 +331,48 @@ function tryRaid() {
   }
 }
 
-// --- PvP: dos jugadores se conectan, votan el modo; si difieren, ruleta entre los dos votos ---
+// --- Rankeds: matchmaking por rango. Familias: 0 Sangano, 1 Obrera, 2 Guardia, 3 Reina.
+// Al inicio solo se emparejan jugadores de la misma familia (se prefiere el rango más cercano);
+// tras 30 s se acepta una familia de diferencia y tras 60 s cualquiera. Luego votan el modo.
+const RK_FAM = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3];
+const rkFam = r => RK_FAM[ni(r, 10)];
+// Lobby de votación entre dos jugadores (partida rápida y rankeds)
+function openLobby(a, b, rank) {
+  const L = { rank: !!rank, a: { s: a.s, prof: a.prof, vote: 0, team: null }, b: { s: b.s, prof: b.prof, vote: 0, team: null }, phase: 'vote', mode: 0, t: null };
+  lobbies.set(a.s.id, L); lobbies.set(b.s.id, L);
+  a.s.emit('plobby', { opp: b.prof, ms: VOTE_MS });
+  b.s.emit('plobby', { opp: a.prof, ms: VOTE_MS });
+  L.t = setTimeout(() => resolveVote(L), VOTE_MS + 500);
+}
+// Partida rápida: no cuenta para rankeds; se empareja por orden de llegada
 function tryPvp() {
   const q = queues.pvp;
   while (q.length >= 2) {
     const a = q.shift(), b = q.shift();
     if (!a.s.connected) { q.unshift(b); continue; }
     if (!b.s.connected) { q.unshift(a); continue; }
-    const L = { a: { s: a.s, prof: a.prof, vote: 0, team: null }, b: { s: b.s, prof: b.prof, vote: 0, team: null }, phase: 'vote', mode: 0, t: null };
-    lobbies.set(a.s.id, L); lobbies.set(b.s.id, L);
-    a.s.emit('plobby', { opp: b.prof, ms: VOTE_MS });
-    b.s.emit('plobby', { opp: a.prof, ms: VOTE_MS });
-    L.t = setTimeout(() => resolveVote(L), VOTE_MS + 500);
+    openLobby(a, b);
   }
 }
+function tryRank() {
+  queues.rank = queues.rank.filter(e => e.s.connected);
+  for (;;) {
+    const q = queues.rank, now = Date.now();
+    let best = null;
+    for (let i = 0; i < q.length; i++) for (let j = i + 1; j < q.length; j++) {
+      const a = q[i], b = q[j], wait = Math.max(now - a.t, now - b.t);
+      const maxFam = wait >= 60000 ? 9 : wait >= 30000 ? 1 : 0;
+      if (Math.abs(rkFam(a.prof.rk) - rkFam(b.prof.rk)) > maxFam) continue;
+      const d = Math.abs(a.prof.rk - b.prof.rk) * 1e6 - wait;
+      if (!best || d < best.d) best = { i, j, d };
+    }
+    if (!best) return;
+    const a = q[best.i], b = q[best.j];
+    queues.rank = q.filter((_, k) => k !== best.i && k !== best.j);
+    openLobby(a, b, true);
+  }
+}
+setInterval(tryRank, 5000);   // reintenta para ampliar la búsqueda de quien lleva tiempo esperando
 
 function resolveVote(L) {
   if (L.phase !== 'vote') return;
@@ -343,8 +403,16 @@ io.on('connection', s => {
   // Sala PvP: no se elige modo antes de entrar; se envía solo el perfil público
   s.on('pvpfind', d => {
     endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
-    queues.pvp.push({ s, prof: cleanProf(s, d && d.prof) });
+    queues.pvp.push({ s, prof: cleanProf(s, d && d.prof), t: Date.now() });
     tryPvp();
+  });
+  // Rankeds: emparejamiento por rango
+  s.on('rkfind', d => {
+    endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
+    const pr = cleanProf(s, d && d.prof), me = db.players[s.data.uid];
+    if (me) { if (me.pw === undefined && pr.pw > 0) { me.pw = Math.min(pr.pw, 500); me.pwt = Date.now(); _ld = null; } if (pr.av) me.av = pr.av; save(); }   // la primera vez se copian las victorias que ya tenía
+    queues.rank.push({ s, prof: pr, t: Date.now() });
+    tryRank();
   });
   s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 8.0'));   // clientes viejos
 
@@ -369,7 +437,7 @@ io.on('connection', s => {
     if (L.a.team && L.b.team) {
       clearTimeout(L.t);
       lobbies.delete(L.a.s.id); lobbies.delete(L.b.s.id);
-      startMatch(L.a.s, L.a.team, L.b.s, L.b.team, false);
+      startMatch(L.a.s, L.a.team, L.b.s, L.b.team, false, L.rank);
     }
   });
 
@@ -407,6 +475,17 @@ io.on('connection', s => {
   });
 
   s.on('done', () => { const m = matches.get(s.id); if (m) m.done.add(s.id); });
+  s.on('rkwin', () => {                                            // el juego avisa que ganó una ranked
+    const m = matches.get(s.id);
+    if (!m || !m.rank || m.won || !m.done.has(s.id)) return;
+    m.won = s.id; rkCredit(s);
+  });
+  s.on('rktop', () => {                                            // ranking de victorias (Top 25)
+    const now = Date.now();
+    if (now - (s.data.rt || 0) < 1500) return;
+    s.data.rt = now;
+    s.emit('rktop', rkBoard(s.data.uid));
+  });
   s.on('leave', () => { endMatch(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
   s.on('disconnect', () => { unqueue(s); endMatch(s); lobbyEnd(s, '🔌 Tu rival se desconectó'); });
 });
