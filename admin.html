@@ -18,7 +18,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 4px;b
 <div id="msg"></div>
 <div id="app" hidden>
  <div class="row tabs"><button id="t1" class="on" onclick="tab(1)">👥 Jugadores</button><button id="t2" class="g" onclick="tab(2)">🚫 Baneados</button><button id="t3" class="g" onclick="tab(3)">💾 Respaldo</button><button class="g" style="flex:none" onclick="out()">Salir</button></div>
- <div id="p1"><div class="row"><input id="q" placeholder="Buscar por nombre o ID" oninput="clearTimeout(window._t);window._t=setTimeout(load,300)"><button onclick="load()">↻</button></div><small id="stat"></small><div class="tw"><table><thead><tr><th>Jugador</th><th>Estado</th><th>Última vez</th><th></th></tr></thead><tbody id="tb"></tbody></table></div></div>
+ <div id="p1"><div class="row"><input id="q" placeholder="Buscar por nombre o ID" oninput="clearTimeout(window._t);window._t=setTimeout(load,300)"><select id="sort" onchange="load()" style="flex:none;width:auto;background:#1f2030;color:#eee;border:1px solid #3b3d57;border-radius:8px;padding:8px"><option value="last">Más recientes</option><option value="gems">💎 Más gemas primero</option></select><button onclick="load()">↻</button></div><div class="row"><label style="flex:none;align-self:center"><small>⚠️ Marcar en rojo desde 💎</small></label><input id="lim" type="number" min="0" value="100000" style="max-width:130px" onchange="localStorage.setItem('mvz_lim',this.value);load()"></div><small id="stat"></small><br><small id="vinfo"></small><div class="row"><button class="r" onclick="banver()">🔒 Bloquear a los conectados con versión distinta</button></div><div class="tw"><table><thead><tr><th>Jugador</th><th>💎 Gemas</th><th>Versión</th><th>Estado</th><th>Última vez</th><th></th></tr></thead><tbody id="tb"></tbody></table></div></div>
  <div id="p2" hidden><div class="tw"><table><thead><tr><th>Jugador</th><th>Motivo</th><th></th></tr></thead><tbody id="tb2"></tbody></table></div><p><small id="ips"></small></p></div>
  <div id="p3" hidden>
   <p><small>El plan gratis de Render <b>borra el archivo de datos</b> al reiniciar o redesplegar. Para que los baneos sobrevivan, copia estas listas y pégalas como variables de entorno en Render (Environment).</small></p>
@@ -30,24 +30,33 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 4px;b
  </div>
 </div>
 <script>
-let K=sessionStorage.getItem('mvz_k')||'';const $=i=>document.getElementById(i);
+let K=sessionStorage.getItem('mvz_k')||'',CV='';const $=i=>document.getElementById(i);
 const say=t=>{$('msg').textContent=t||''};
 async function api(path,body){const r=await fetch('/admin/api/'+path,{method:body?'POST':'GET',headers:{'x-admin-key':K,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('Error '+r.status));return j}
 async function enter(){K=$('key').value||K;try{await api('players');sessionStorage.setItem('mvz_k',K);$('login').hidden=true;$('app').hidden=false;say('');load()}catch(e){say(e.message);K=''}}
 function out(){sessionStorage.removeItem('mvz_k');K='';$('app').hidden=true;$('login').hidden=false;$('key').value=''}
 function tab(n){[1,2,3].forEach(i=>{$('p'+i).hidden=i!=n;$('t'+i).className=i==n?'on':'g'});say('');if(n==1)load();if(n==2)bans();if(n==3)backup()}
+const fmt=n=>Number(n||0).toLocaleString('de-DE');
 const ago=t=>{const s=Math.max(0,(Date.now()-t)/1000);return s<90?'ahora':s<5400?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' días'};
 function cell(tr,txt,cls){const td=document.createElement('td');if(cls)td.className=cls;td.textContent=txt;tr.appendChild(td);return td}
 function copy(t){navigator.clipboard&&navigator.clipboard.writeText(t);say('ID copiado')}
-async function load(){try{const j=await api('players?q='+encodeURIComponent($('q').value||''));$('stat').textContent=j.total+' cuentas registradas · '+j.online+' conectadas ahora';const tb=$('tb');tb.innerHTML='';
+async function load(){try{const j=await api('players?q='+encodeURIComponent($('q').value||'')+'&sort='+$('sort').value);CV=j.currentVer||'';$('vinfo').textContent='Versión oficial: '+(CV||'¿?')+' · última versión con la que se conectó cada cuenta: '+Object.entries(j.vers||{}).map(([v,n])=>v+' ×'+n).join(' · ')+(j.vdiff?'  ⚠️ '+j.vdiff+' con otra versión':'');$('stat').textContent=j.total+' cuentas registradas · '+j.online+' conectadas ahora · 💎 en total (reportado por los juegos): '+fmt(j.gemsSum);const tb=$('tb');tb.innerHTML='';
  j.list.forEach(p=>{const tr=document.createElement('tr');const td=cell(tr,p.name);td.appendChild(document.createElement('br'));const u=document.createElement('span');u.className='uid';u.textContent=p.uid;u.onclick=()=>copy(p.uid);td.appendChild(u);
-  const st=cell(tr,'');const b=document.createElement('span');b.className='b '+(p.banned?'ban_':p.online?'on_':'off_');b.textContent=p.banned?'baneado':p.online?'online':'offline';st.appendChild(b);if(p.banned&&p.reason){st.appendChild(document.createElement('br'));const s=document.createElement('small');s.textContent=p.reason;st.appendChild(s)}
+  const gc=cell(tr,'');gc.style.whiteSpace='nowrap';
+  if(p.gt){const hi=p.gems>=(+$('lim').value||1e18);const gb=document.createElement('b');gb.textContent=(hi?'⚠️ ':'')+fmt(p.gems);if(hi)gb.style.color='#f87171';gc.appendChild(gb);gc.appendChild(document.createElement('br'));const gm=document.createElement('small');gm.textContent=p.chars+' pers. · '+p.wins+' vict. · '+ago(p.gt);gc.appendChild(gm)}
+  else{gc.textContent='—';gc.title='Aún no informa sus gemas (debe tener el juego actualizado y conectarse)';gc.style.color='#6b7280'}
+  const vc=cell(tr,p.ver||'—');vc.style.whiteSpace='nowrap';if(p.vdiff){vc.style.color='#f87171';vc.style.fontWeight='700';vc.title='Distinta a la versión oficial ('+CV+')'}
+  const st=cell(tr,'');const b=document.createElement('span');b.className='b '+(p.banned?'ban_':p.online?'on_':'off_');b.textContent=p.banned?(p.lock?'bloqueado':'baneado'):p.online?'online':'offline';st.appendChild(b);if(p.banned&&p.reason){st.appendChild(document.createElement('br'));const s=document.createElement('small');s.textContent=p.reason;st.appendChild(s)}
   cell(tr,ago(p.last));const ac=document.createElement('td');const bt=document.createElement('button');
   if(p.banned){bt.textContent='Desbanear';bt.className='ok';bt.onclick=()=>unban(p.uid)}else{bt.textContent='Banear';bt.className='r';bt.onclick=()=>ban(p)}ac.appendChild(bt);
+  if(!p.banned){const lb=document.createElement('button');lb.textContent='🔒 Versión';lb.className='r';lb.style.marginLeft='6px';lb.title='Bloquear con el mensaje "Actualiza el cliente para seguir jugando"';lb.onclick=()=>lockban(p);ac.appendChild(lb)}
   if(!p.banned){const gb=document.createElement('button');gb.textContent='🎁 Dar';gb.className='ok';gb.style.marginLeft='6px';gb.onclick=()=>gift(p);ac.appendChild(gb);const sb=document.createElement('button');sb.textContent='💎 Fijar';sb.className='ok';sb.style.marginLeft='6px';sb.onclick=()=>setgems(p);ac.appendChild(sb);if(p.gifts){const pg=document.createElement('small');pg.textContent=' ('+p.gifts+' pend.)';ac.appendChild(pg)}}
   tr.appendChild(ac);tb.appendChild(tr)})}catch(e){say(e.message)}}
 async function ban(p){const r=prompt('Motivo del baneo para "'+p.name+'" (lo verá el jugador):','Trampas');if(r===null)return;const ip=p.ips&&p.ips.length?confirm('¿Bloquear también sus IPs ('+p.ips.join(', ')+')?\nOjo: puede afectar a otras personas de la misma red. Cancelar = solo la cuenta.'):false;
  try{const j=await api('ban',{uid:p.uid,reason:r,ip});say('Baneado. Sesiones expulsadas: '+j.kicked);load()}catch(e){say(e.message)}}
+async function lockban(p){if(!confirm('¿Bloquear a "'+p.name+'"?\nVerá "Actualiza el cliente para seguir jugando", sin poder quitarlo, ni reiniciando el juego.'))return;const ip=p.ips&&p.ips.length?confirm('¿Bloquear también sus IPs ('+p.ips.join(', ')+')?\nOjo: puede afectar a otras personas de la misma red. Cancelar = solo la cuenta.'):false;
+ try{const j=await api('ban',{uid:p.uid,reason:'Cliente desactualizado',ip,lock:true});say('Bloqueado. Sesiones expulsadas: '+j.kicked);load()}catch(e){say(e.message)}}
+async function banver(){try{const d=await api('banver',{dry:true});if(!d.count)return say('No hay conectados con una versión distinta a '+CV);if(!confirm('Hay '+d.count+' jugador(es) conectado(s) con una versión distinta a '+CV+':\n'+d.names.join(', ')+'\n\n¿Bloquearlos a todos? Verán "Actualiza el cliente para seguir jugando" y no podrán quitarlo.'))return;const ip=confirm('¿Bloquear también sus IPs? (Cancelar = solo las cuentas)');const j=await api('banver',{ip});say('Bloqueados: '+j.count);load()}catch(e){say(e.message)}}
 async function gift(p){const g=prompt('Gemas para "'+p.name+'" (0 si solo tickets):','500');if(g===null)return;const t=prompt('Tickets (0 si ninguno):','0');if(t===null)return;const m=prompt('Mensaje para el jugador (opcional):','');if(m===null)return;
  try{const j=await api('gift',{uid:p.uid,gems:+g||0,tk:+t||0,msg:m});say(j.delivered?'🎁 Entregado: el jugador está conectado y ya lo recibe':'🎁 Guardado: lo recibirá la próxima vez que se conecte');load()}catch(e){say(e.message)}}
 async function setgems(p){const g=prompt('¿A cuántas gemas quieres FIJAR a "'+p.name+'"? (cantidad exacta; reemplaza las que tiene)','1000');if(g===null)return;const n=Math.floor(Number(g));if(!Number.isFinite(n)||n<0){say('Cantidad inválida');return}if(!confirm('Se cambiarán las gemas de "'+p.name+'" a '+n+'. ¿Seguro?'))return;const m=prompt('Mensaje para el jugador (opcional):','');if(m===null)return;
@@ -57,5 +66,6 @@ async function bans(){try{const j=await api('bans');const tb=$('tb2');tb.innerHT
  $('ips').textContent=(j.ips.length+j.envIps.length)?'IPs bloqueadas: '+[...j.ips,...j.envIps].join(', '):'Sin IPs bloqueadas'}catch(e){say(e.message)}}
 async function backup(){try{const j=await api('backup');$('bu').value=j.BANNED_UIDS;$('bi').value=j.BANNED_IPS;$('bj').value=JSON.stringify({bans:j.bans,ipbans:j.ipbans})}catch(e){say(e.message)}}
 async function restore(){let o;try{o=JSON.parse($('rs').value)}catch(e){return say('JSON inválido')}try{const j=await api('restore',o);say('Restaurados: '+j.added+' baneos nuevos');$('rs').value='';backup()}catch(e){say(e.message)}}
+$('lim').value=localStorage.getItem('mvz_lim')||100000;
 $('key').addEventListener('keydown',e=>{if(e.key=='Enter')enter()});if(K){$('key').value=K;enter()}
 </script></body></html>

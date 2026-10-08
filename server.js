@@ -16,6 +16,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+// Versión "oficial" del cliente: se lee sola de index.html (const VER='...'), o de la variable CLIENT_VER si la defines
+let CURRENT_VER = String(process.env.CLIENT_VER || '').trim();
+if (!CURRENT_VER) { try { CURRENT_VER = (fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8').match(/const VER='([^']+)'/) || [])[1] || ''; } catch (e) {} }
+const cver = v => String(v || '').replace(/[^0-9A-Za-z._-]/g, '').slice(0, 16);
 const cid = v => String(v || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
 const clean = (v, n) => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, n);
 const sha = v => crypto.createHash('sha256').update(String(v)).digest('hex');
@@ -41,6 +45,15 @@ for (const sg of ['SIGTERM', 'SIGINT']) process.on(sg, () => process.exit(0));
 const banInfo = uid => db.bans[uid] || (envBans.has(uid) ? { reason: 'Baneo permanente', env: true } : null);
 const ipBanned = ip => !!ip && !!(db.ipbans[ip] || envIps.has(ip));
 const online = new Map();                 // uid -> Set(sockets)
+// Gemas y datos del jugador tal como los INFORMA su juego (sirve para el panel de admin; no es un dato verificado)
+let lastStatSave = 0;
+function noteStats(p, d) {
+  if (!p || !d || typeof d !== 'object' || d.gems === undefined) return;
+  const n = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0)), now = Date.now(), g = n(d.gems, 1e9);
+  const changed = p.gems !== g;
+  p.gems = g; p.chars = n(d.chars, 1000); p.wins = n(d.wins, 1e9); p.battles = n(d.battles, 1e9); p.days = n(d.days, 100000); p.gt = now;
+  if (changed && now - lastStatSave > 20000) { lastStatSave = now; save(); }      // no escribir el archivo en cada reporte
+}
 const sockIp = s => firstIp(s.handshake.headers) || s.handshake.address || '';
 const regIp = new Map();                  // límite de cuentas nuevas por IP
 
@@ -51,7 +64,7 @@ io.use((s, next) => {
   const ban = banInfo(uid);
   if (ban || ipBanned(ip)) {
     const e = new Error('baneado');
-    e.data = { reason: ban ? ban.reason : 'Tu conexión está bloqueada' };
+    e.data = { reason: ban ? ban.reason : 'Tu conexión está bloqueada', lock: !!(ban && ban.lock) };
     return next(e);
   }
   const now = Date.now(), h = sha(tok);
@@ -64,11 +77,12 @@ io.use((s, next) => {
     r.n++; regIp.set(ip, r);
     p = db.players[uid] = { name: 'Jugador', tok: h, first: now, last: now, ips: [] };
   }
-  p.last = now;
+  p.last = now; p.ver = cver(a.ver); p.vt = now;
   const nm = clean(a.name, 14); if (nm) p.name = nm;
+  noteStats(p, a);                                  // gemas y datos que informa el juego al conectarse
   if (ip && !p.ips.includes(ip)) { p.ips.push(ip); if (p.ips.length > 5) p.ips.shift(); }
   save();
-  s.data.uid = uid; s.data.ip = ip;
+  s.data.uid = uid; s.data.ip = ip; s.data.ver = p.ver;
   next();
 });
 
@@ -77,6 +91,10 @@ io.on('connection', s => {
   if (!online.has(uid)) online.set(uid, new Set());
   online.get(uid).add(s);
   if (db.gifts[uid] && db.gifts[uid].length) s.emit('gifts', db.gifts[uid]);   // regalos pendientes del admin
+  s.on('stat', d => {                                                          // el juego informa sus gemas cada rato
+    const p = db.players[uid];
+    if (p && Date.now() - (p.gt || 0) > 5000) noteStats(p, d);
+  });
   s.on('giftok', ids => {                                                      // el jugador confirma que ya los cobró
     if (!Array.isArray(ids) || !db.gifts[uid]) return;
     const ok = new Set(ids.slice(0, 50).map(x => String(x)));
@@ -91,14 +109,14 @@ io.on('connection', s => {
   });
 });
 
-function kickSock(s, reason) { s.emit('banned', { reason }); s.disconnect(true); }
-function banUid(uid, reason, alsoIp) {
+function kickSock(s, reason, lock) { s.emit('banned', { reason, lock: !!lock }); s.disconnect(true); }
+function banUid(uid, reason, alsoIp, lock) {
   const p = db.players[uid];
-  db.bans[uid] = { reason: clean(reason, 80) || 'Trampas', at: Date.now(), name: p ? p.name : '?' };
+  db.bans[uid] = { reason: clean(reason, 80) || 'Trampas', at: Date.now(), name: p ? p.name : '?', lock: !!lock };
   if (alsoIp && p) for (const ip of p.ips) db.ipbans[ip] = { uid, at: Date.now() };
   save();
   let n = 0;
-  for (const s of [...(online.get(uid) || [])]) { kickSock(s, db.bans[uid].reason); n++; }
+  for (const s of [...(online.get(uid) || [])]) { kickSock(s, db.bans[uid].reason, db.bans[uid].lock); n++; }
   if (alsoIp) for (const set of [...online.values()]) for (const s of [...set]) if (ipBanned(s.data.ip)) { kickSock(s, 'Tu conexión está bloqueada'); n++; }
   return n;
 }
@@ -123,12 +141,16 @@ function adminAuth(req, res, next) {
 }
 app.get('/admin', (_, res) => { res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' }); res.sendFile(path.join(__dirname, 'admin.html')); });
 app.get('/admin/api/players', adminAuth, (req, res) => {
-  const q = clean(req.query && req.query.q, 30).toLowerCase();
+  const q = clean(req.query && req.query.q, 30).toLowerCase(), sortGems = (req.query && req.query.sort) === 'gems';
   const list = Object.entries(db.players)
     .filter(([uid, p]) => !q || uid.toLowerCase().includes(q) || String(p.name).toLowerCase().includes(q))
-    .sort((a, b) => b[1].last - a[1].last).slice(0, 200)
-    .map(([uid, p]) => { const b = banInfo(uid); return { uid, name: p.name, first: p.first, last: p.last, online: online.has(uid), gifts: (db.gifts[uid] || []).length, ips: p.ips.slice(-3), banned: !!b, reason: b ? b.reason : '' }; });
-  res.json({ total: Object.keys(db.players).length, online: online.size, list });
+    .sort(sortGems ? (a, b) => (b[1].gems || 0) - (a[1].gems || 0) || b[1].last - a[1].last : (a, b) => b[1].last - a[1].last).slice(0, 200)
+    .map(([uid, p]) => { const b = banInfo(uid); return { uid, name: p.name, first: p.first, last: p.last, online: online.has(uid), gifts: (db.gifts[uid] || []).length, ips: p.ips.slice(-3), banned: !!b, reason: b ? b.reason : '', lock: !!(b && b.lock), ver: p.ver || '', vt: p.vt || 0, vdiff: !!CURRENT_VER && (p.ver || '') !== CURRENT_VER,
+      gems: p.gems || 0, chars: p.chars || 0, wins: p.wins || 0, battles: p.battles || 0, gt: p.gt || 0 }; });
+  const gemsSum = Object.values(db.players).reduce((t, p) => t + (p.gems || 0), 0);
+  const vers = {}; let vdiff = 0;
+  for (const p of Object.values(db.players)) { const v = p.ver || '—'; vers[v] = (vers[v] || 0) + 1; if (CURRENT_VER && (p.ver || '') !== CURRENT_VER) vdiff++; }
+  res.json({ total: Object.keys(db.players).length, online: online.size, gemsSum, list, currentVer: CURRENT_VER, vers, vdiff });
 });
 app.get('/admin/api/bans', adminAuth, (_, res) => {
   const list = [...new Set([...Object.keys(db.bans), ...envBans])].map(uid => { const b = banInfo(uid), p = db.players[uid]; return { uid, name: (b && b.name) || (p && p.name) || '?', reason: b.reason, at: b.at || 0, env: !!b.env && !db.bans[uid] }; });
@@ -137,8 +159,15 @@ app.get('/admin/api/bans', adminAuth, (_, res) => {
 app.post('/admin/api/ban', adminAuth, (req, res) => {
   const uid = cid(req.body && req.body.uid);
   if (uid.length < 8) return res.status(400).json({ error: 'ID inválido' });
-  const kicked = banUid(uid, req.body.reason, !!req.body.ip);
+  const kicked = banUid(uid, req.body.reason, !!req.body.ip, !!req.body.lock);
   res.json({ ok: true, kicked });
+});
+app.post('/admin/api/banver', adminAuth, (req, res) => {       // bloquear a todos los CONECTADOS con una versión distinta a la oficial
+  if (!CURRENT_VER) return res.status(400).json({ error: 'El servidor no conoce la versión oficial (falta const VER en index.html o la variable CLIENT_VER)' });
+  const targets = [...online.entries()].filter(([uid, set]) => !banInfo(uid) && [...set].some(s => s.data.ver !== CURRENT_VER)).map(([uid]) => uid);
+  if (req.body && req.body.dry) return res.json({ ok: true, count: targets.length, names: targets.slice(0, 30).map(u => (db.players[u] && db.players[u].name) || u) });
+  for (const uid of targets) banUid(uid, 'Cliente desactualizado', !!(req.body && req.body.ip), true);
+  res.json({ ok: true, count: targets.length });
 });
 app.post('/admin/api/unban', adminAuth, (req, res) => {
   const uid = cid(req.body && req.body.uid);
@@ -183,7 +212,7 @@ app.post('/admin/api/restore', adminAuth, (req, res) => {
   for (const k of Object.keys(b).slice(0, 5000)) {
     const uid = cid(k); if (uid.length < 8) continue;
     const v = b[k] || {}; if (!db.bans[uid]) n++;
-    banUid(uid, v.reason, false);
+    banUid(uid, v.reason, false, !!v.lock);
     db.bans[uid].name = clean(v.name, 14) || db.bans[uid].name;
   }
   for (const ip of Object.keys(ib).slice(0, 5000)) db.ipbans[clean(ip, 64)] = { uid: cid(ib[ip] && ib[ip].uid), at: Date.now() };
@@ -192,6 +221,10 @@ app.post('/admin/api/restore', adminAuth, (req, res) => {
 });
 if (!ADMIN_KEY) console.warn('⚠ ADMIN_KEY no está definida: el panel /admin está desactivado hasta que la configures');
 
+app.get('/lockcheck', (req, res) => {      // el cliente bloqueado pregunta si sigue bloqueado (así un desbaneo lo libera)
+  res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+  res.json({ locked: !!banInfo(cid(req.query && req.query.uid)) });
+});
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
