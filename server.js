@@ -528,6 +528,7 @@ function gemSpawn(des) {                             // des = true -> gema del D
   for (let k = 0; k < 40; k++) {
     const x = 80 + Math.random() * (WW - 160), y = des ? WY0 + 80 + Math.random() * (-WY0 - 140) : 80 + Math.random() * (WH - 160);
     if (!des && Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
+    if (!des && x > 960 && x < 1440 && y > 1440) continue;               // plaza del Mercado (sin gemas dentro)
     if (des && Math.hypot(x - NPC.x, y - NPC.y) < 150) continue;
     const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y), d: des ? 1 : 0 };
     gems.set(g.id, g); io.to('world').emit('wgnew', g); return;
