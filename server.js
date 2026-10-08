@@ -90,6 +90,7 @@ io.on('connection', s => {
   const uid = s.data.uid;
   if (!online.has(uid)) online.set(uid, new Set());
   online.get(uid).add(s);
+  s.emit('bonus', bonusState());                                              // estado del evento x2
   if (db.gifts[uid] && db.gifts[uid].length) s.emit('gifts', db.gifts[uid]);   // regalos pendientes del admin
   s.on('stat', d => {                                                          // el juego informa sus gemas cada rato
     const p = db.players[uid];
@@ -225,6 +226,25 @@ app.get('/lockcheck', (req, res) => {      // el cliente bloqueado pregunta si s
   res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
   res.json({ locked: !!banInfo(cid(req.query && req.query.uid)) });
 });
+// ===== Evento diario: recompensas x2 en PvP y Rankeds =====
+// Todos los días a las 2:00 pm y a las 8:00 pm hora de Ciudad de México, durante 1 hora cada vez.
+// Se puede cambiar con variables de entorno: BONUS_TIMES (ej. "14:00,20:00", hora CDMX en 24 h) y BONUS_LEN (minutos de duración).
+const BONUS_TZ = 'America/Mexico_City';
+const BONUS_STARTS = String(process.env.BONUS_TIMES || '14:00,20:00').split(',').map(t => { const [h, m] = t.trim().split(':'); return (Number(h) || 0) * 60 + (Number(m) || 0); }).filter(x => x >= 0 && x < 1440);
+const BONUS_LEN = Number(process.env.BONUS_LEN ?? 60);
+const mxFmt = new Intl.DateTimeFormat('en-US', { timeZone: BONUS_TZ, hourCycle: 'h23', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+function mxSecs(d) { const o = {}; for (const p of mxFmt.formatToParts(d)) o[p.type] = p.value; return (+o.hour * 60 + +o.minute) * 60 + +o.second; }
+function bonusState() {
+  const now = Date.now(), sec = mxSecs(new Date(now)), len = BONUS_LEN * 60;
+  const act = BONUS_STARTS.map(m => m * 60).find(a => sec >= a && sec < a + len);          // ventana activa ahora (si hay)
+  if (act !== undefined) return { on: true, x: 2, now, until: now + (act + len - sec) * 1000, next: 0 };
+  const nx = Math.min(...BONUS_STARTS.map(m => { const d = m * 60 - sec; return d > 0 ? d : d + 86400; }));
+  return { on: false, x: 2, now, until: 0, next: now + nx * 1000 };
+}
+let bonusOn = bonusState().on;
+setInterval(() => { const b = bonusState(); if (b.on !== bonusOn) { bonusOn = b.on; io.emit('bonus', b); } }, 3000);   // avisa a todos al empezar y al terminar
+app.get('/bonus', (_, res) => { res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }); res.json(bonusState()); });   // los juegos lo consultan aunque no estén conectados por socket
+
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
