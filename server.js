@@ -24,10 +24,10 @@ const cid = v => String(v || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
 const clean = (v, n) => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, n);
 const sha = v => crypto.createHash('sha256').update(String(v)).digest('hex');
 const firstIp = h => String((h && h['x-forwarded-for']) || '').split(',')[0].trim();
-let db = { players: {}, bans: {}, ipbans: {}, gifts: {}, crews: {}, trd: {} };
+let db = { players: {}, bans: {}, ipbans: {}, gifts: {}, crews: {}, trd: {}, accts: {} };
 try {
   const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {}, crews: d.crews || {}, trd: d.trd || {} };
+  db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {}, crews: d.crews || {}, trd: d.trd || {}, accts: d.accts || {} };
   console.log('Datos cargados: ' + Object.keys(db.players).length + ' jugadores, ' + Object.keys(db.bans).length + ' baneados');
 } catch (e) { console.log('Sin archivo de datos previo: se creará uno nuevo en ' + DATA_FILE); }
 const envBans = new Set((process.env.BANNED_UIDS || '').split(',').map(cid).filter(Boolean));
@@ -245,6 +245,68 @@ let bonusOn = bonusState().on;
 setInterval(() => { const b = bonusState(); if (b.on !== bonusOn) { bonusOn = b.on; io.emit('bonus', b); } }, 3000);   // avisa a todos al empezar y al terminar
 app.get('/bonus', (_, res) => { res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }); res.json(bonusState()); });   // los juegos lo consultan aunque no estén conectados por socket
 
+// ===== Cuentas básicas (nombre + contraseña) para pasar la partida de un dispositivo a otro =====
+// Todo se guarda en data.json junto al servidor (sin nube). Las contraseñas se guardan con scrypt (nunca en claro).
+// OJO: en el plan gratis de Render data.json se borra al reiniciar; usa un Disco persistente y apunta DATA_FILE a él.
+app.use('/acct', (req, res, next) => {
+  res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Cache-Control': 'no-store' });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+}, express.json({ limit: '3mb' }));
+const acctKey = n => String(n || '').normalize('NFKC').trim().toLowerCase();
+const acctOkName = n => /^[\p{L}\p{N}_.\- ]{3,20}$/u.test(n);
+const acctHash = (pw, salt) => crypto.scryptSync(String(pw), salt, 32).toString('hex');
+const acctTries = new Map(), acctNew = new Map();     // intentos fallidos (ip|nombre) y cuentas nuevas por IP
+const acctFail = k => { const e = acctTries.get(k); if (!e || Date.now() - e.t > 600000) acctTries.set(k, { n: 1, t: Date.now() }); else { e.n++; e.t = Date.now(); } };
+setInterval(() => { const now = Date.now(); for (const [k, e] of acctTries) if (now - e.t > 600000) acctTries.delete(k); for (const [k, e] of acctNew) if (now - e.t > 3600000) acctNew.delete(k); }, 600000);
+function acctValidSave(s) {
+  if (typeof s !== 'string' || s.length < 2 || s.length > 2.5e6) return '';
+  try { const o = JSON.parse(s); return o && typeof o === 'object' && !Array.isArray(o) ? s : ''; } catch (e) { return ''; }
+}
+function acctAuth(req, res) {
+  const b = req.body || {}, name = acctKey(b.name), k = (firstIp(req.headers) || req.ip) + '|' + name;
+  const t = acctTries.get(k);
+  if (t && t.n >= 8 && Date.now() - t.t < 600000) { res.status(429).json({ ok: false, err: 'Demasiados intentos. Espera unos minutos.' }); return null; }
+  const a = db.accts[name];
+  let good = false;
+  if (a) { try { good = crypto.timingSafeEqual(Buffer.from(acctHash(b.pass, a.salt), 'hex'), Buffer.from(a.hash, 'hex')); } catch (e) {} }
+  if (!good) { acctFail(k); res.status(401).json({ ok: false, err: 'Nombre o contraseña incorrectos' }); return null; }
+  acctTries.delete(k);
+  return a;
+}
+app.post('/acct/register', (req, res) => {
+  const b = req.body || {}, name = clean(b.name, 20).replace(/\s+/g, ' '), key = acctKey(name), pass = String(b.pass || '');
+  if (!acctOkName(name)) return res.status(400).json({ ok: false, err: 'El nombre debe tener de 3 a 20 letras, números o _ . -' });
+  if (pass.length < 4 || pass.length > 64) return res.status(400).json({ ok: false, err: 'La contraseña debe tener de 4 a 64 caracteres' });
+  if (db.accts[key]) return res.status(409).json({ ok: false, err: 'Ese nombre de cuenta ya existe' });
+  const ip = firstIp(req.headers) || req.ip, e = acctNew.get(ip) || { n: 0, t: Date.now() };
+  if (e.n >= 5) return res.status(429).json({ ok: false, err: 'Demasiadas cuentas nuevas desde esta conexión. Intenta más tarde.' });
+  e.n++; acctNew.set(ip, e);
+  const salt = crypto.randomBytes(16).toString('hex'), data = acctValidSave(b.save);
+  db.accts[key] = { name, salt, hash: acctHash(pass, salt), save: data, t: data ? Date.now() : 0, c: Date.now() };
+  save();
+  res.json({ ok: true, name, t: db.accts[key].t });
+});
+app.post('/acct/login', (req, res) => {
+  const a = acctAuth(req, res); if (!a) return;
+  res.json({ ok: true, name: a.name, t: a.t || 0, save: a.save || '' });
+});
+app.post('/acct/save', (req, res) => {
+  const a = acctAuth(req, res); if (!a) return;
+  const b = req.body || {}, data = acctValidSave(b.save);
+  if (!data) return res.status(400).json({ ok: false, err: 'Partida no válida o demasiado grande' });
+  if (!b.force && a.t && Number(b.base || 0) < a.t) return res.status(409).json({ ok: false, conflict: true, t: a.t, err: 'La cuenta tiene una partida más reciente' });
+  a.save = data; a.t = Date.now(); save();
+  res.json({ ok: true, t: a.t });
+});
+app.post('/acct/passwd', (req, res) => {
+  const a = acctAuth(req, res); if (!a) return;
+  const np = String((req.body || {}).npass || '');
+  if (np.length < 4 || np.length > 64) return res.status(400).json({ ok: false, err: 'La contraseña nueva debe tener de 4 a 64 caracteres' });
+  a.salt = crypto.randomBytes(16).toString('hex'); a.hash = acctHash(np, a.salt); save();
+  res.json({ ok: true });
+});
+app.use('/acct', (err, req, res, next) => res.status(err.status || 400).json({ ok: false, err: 'Datos no válidos o demasiado grandes' }));
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
