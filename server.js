@@ -677,7 +677,8 @@ function gemSpawn(des) {                             // des = true -> gema del D
   for (let k = 0; k < 40; k++) {
     const x = 80 + Math.random() * (WW - 160), y = des ? WY0 + 80 + Math.random() * (-WY0 - 140) : 80 + Math.random() * (WH - 160);
     if (!des && Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
-    if (!des && x > 960 && x < 1440 && y > 1440) continue;               // plaza del Mercado (sin gemas dentro)
+    if (!des && x > 960 && x < 1440 && y > 1440) continue;
+    if (!des && x > 1700 && y > 500 && y < 1300) continue;               // la Mina (sin gemas dentro)               // plaza del Mercado (sin gemas dentro)
     if (des && Math.hypot(x - NPC.x, y - NPC.y) < 150) continue;
     const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y), d: des ? 1 : 0 };
     gems.set(g.id, g); io.to('world').emit('wgnew', g); return;
@@ -693,6 +694,29 @@ function gemReset() {                                // cada 2 h: se borran las 
   if (world.size) pushChat({ sys: true, text: '💎 ¡Las gemas escondidas se reiniciaron! Hay ' + gems.size + ' nuevas por el mapa' });
 }
 setInterval(gemReset, GEM_RESET);
+
+// --- La Mina: minerales para todo el servidor (los toma quien llegue primero; se reinician cada 30 minutos) ---
+// Para cambiar los premios: lo (mínimo) y hi (máximo) por mineral; k:'m' = monedas 🪙, k:'g' = gemas 💎; cnt = cuántos salen en cada reinicio
+const MINE = { x1: 1780, x2: 2360, y1: 560, y2: 1240, gy: 900 }, ORE_RESET = 30 * 60 * 1000;
+const ORE_T = { c: { n: 'Carbón', k: 'm', lo: 3, hi: 6, cnt: 12 }, k: { n: 'Cobre', k: 'm', lo: 8, hi: 14, cnt: 8 }, i: { n: 'Hierro', k: 'm', lo: 18, hi: 30, cnt: 5 },
+  o: { n: 'Oro', k: 'g', lo: 60, hi: 120, cnt: 2 }, d: { n: 'Diamante', k: 'g', lo: 250, hi: 400, cnt: 1 } };
+const ores = new Map(); let oreSeq = 0, oreNext = Date.now() + ORE_RESET;
+function oreSpawnAll() {
+  ores.clear();
+  for (const t of ['d', 'o', 'i', 'k', 'c']) for (let i = 0; i < ORE_T[t].cnt; i++) for (let k = 0; k < 300; k++) {      // primero los raros, para que siempre salgan
+    const x = MINE.x1 + 80 + Math.random() * (MINE.x2 - MINE.x1 - 160), y = MINE.y1 + 80 + Math.random() * (MINE.y2 - MINE.y1 - 160);
+    if (x < MINE.x1 + 170 && Math.abs(y - MINE.gy) < 100) continue;            // deja libre la entrada
+    if ([...ores.values()].some(o => Math.hypot(o.x - x, o.y - y) < 65)) continue;
+    const o = { id: ++oreSeq, x: Math.round(x), y: Math.round(y), t }; ores.set(o.id, o); break;
+  }
+}
+oreSpawnAll();
+function oreReset() {
+  oreSpawnAll(); oreNext = Date.now() + ORE_RESET;
+  io.to('world').emit('wores', { list: [...ores.values()], next: oreNext, now: Date.now() });
+  if (world.size) pushChat({ sys: true, text: '⛏️ ¡La mina se reinició! Hay ' + ores.size + ' minerales nuevos' });
+}
+setInterval(oreReset, ORE_RESET);
 
 // --- Amigos: solicitudes, regalo de gemas y mensajes directos ---
 const FR_GIFT = 25;                                   // gemas para cada uno al hacerse amigos (una vez por pareja)
@@ -726,7 +750,7 @@ io.on('connection', s => {
     const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false, lc: 0, ld: 0, lr: 0,
       uid: cleanUid(d && d.uid), fr: new Set((Array.isArray(d && d.fr) ? d.fr : []).slice(0, 300).map(cleanUid)) };
     if (p.uid) uidSock.set(p.uid, s.id);
-    s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub), gems: [...gems.values()], chat: chatLog });
+    s.emit('wstate', { you: s.id, players: [...world.values(), p].map(pub), gems: [...gems.values()], ores: [...ores.values()], oreNext, now: Date.now(), chat: chatLog });
     world.set(s.id, p);
     s.join('world');
     s.to('world').emit('wjoined', pub(p));
@@ -753,6 +777,19 @@ io.on('connection', s => {
     if (!text || now - p.lc < 700) return;          // anti-spam: 1 mensaje cada 0,7 s
     p.lc = now;
     pushChat({ id: s.id, name: p.name, text });
+  });
+
+  s.on('wmine', d => {
+    const p = world.get(s.id), o = d && ores.get(d.id), now = Date.now();
+    if (!p || !o || now - (p.lm || 0) < 400) return;
+    p.lm = now;
+    if (!(p.x > MINE.x1 && p.x < MINE.x2 + 20 && p.y > MINE.y1 && p.y < MINE.y2)) return;   // tiene que estar dentro de la mina
+    if (Math.hypot(p.x - o.x, p.y - o.y) > 130) return;                                     // y cerca del mineral
+    ores.delete(o.id);                                                                      // el primero que llega se lo queda
+    const T = ORE_T[o.t], amt = T.lo + Math.floor(Math.random() * (T.hi - T.lo + 1));
+    s.emit('wmined', { id: o.id, t: o.t, k: T.k, amt });
+    io.to('world').emit('wogone', o.id);
+    if (T.k === 'g') pushChat({ sys: true, text: '⛏️ ' + p.name + ' sacó ' + T.n + ' y ganó 💎' + amt });
   });
 
   s.on('wgem', d => {
