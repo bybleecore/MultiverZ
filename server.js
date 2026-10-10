@@ -660,7 +660,7 @@ io.on('connection', s => {
 });
 
 // ===== Mundo abierto: jardín compartido con estanque, chat y gemas escondidas =====
-const WW = 2400, WH = 1800, WY0 = -1000, NPC = { x: 1200, y: -760 }, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
+const WW = 4840, LW = 2400, WH = 1800, WY0 = -1000, NPC = { x: 1200, y: -760 }, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
 const world = new Map();           // socket.id -> { id, name, av, x, y, t, dirty }
 const pub = p => ({ id: p.id, name: p.name, av: p.av, x: Math.round(p.x), y: Math.round(p.y) });
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -675,10 +675,9 @@ const GEM_N = 12, GEM_D = 15, GEM_VALS_D = [30, 50, 50, 100, 150, 300], GEM_RESE
 const gems = new Map(); let gemSeq = 0;
 function gemSpawn(des) {                             // des = true -> gema del Desierto (parte de arriba del mapa)
   for (let k = 0; k < 40; k++) {
-    const x = 80 + Math.random() * (WW - 160), y = des ? WY0 + 80 + Math.random() * (-WY0 - 140) : 80 + Math.random() * (WH - 160);
+    const x = 80 + Math.random() * (LW - 160), y = des ? WY0 + 80 + Math.random() * (-WY0 - 140) : 80 + Math.random() * (WH - 160);
     if (!des && Math.hypot(x - POND.x, y - POND.y) < POND.r + 60) continue;
     if (!des && x > 960 && x < 1440 && y > 1440) continue;
-    if (!des && x > 1600 && y > 300 && y < 1500) continue;               // la Mina (sin gemas dentro)               // plaza del Mercado (sin gemas dentro)
     if (des && Math.hypot(x - NPC.x, y - NPC.y) < 150) continue;
     const g = { id: ++gemSeq, x: Math.round(x), y: Math.round(y), d: des ? 1 : 0 };
     gems.set(g.id, g); io.to('world').emit('wgnew', g); return;
@@ -697,9 +696,9 @@ setInterval(gemReset, GEM_RESET);
 
 // --- La Mina: minerales para todo el servidor (los toma quien llegue primero; se reinician cada 30 minutos) ---
 // Para cambiar los premios: lo (mínimo) y hi (máximo) por mineral; ms = cuánto hay que mantener presionado para sacarlo (milisegundos); k:'m' = monedas 🪙, k:'g' = gemas 💎; cnt = cuántos salen en cada reinicio
-const MINE = { x1: 1640, x2: 2360, y1: 360, y2: 1440, gy: 900 }, ORE_RESET = 30 * 60 * 1000;
-const ORE_T = { c: { n: 'Carbón', k: 'm', lo: 3, hi: 6, ms: 1000, cnt: 22 }, k: { n: 'Cobre', k: 'm', lo: 8, hi: 14, ms: 1800, cnt: 14 }, i: { n: 'Hierro', k: 'm', lo: 18, hi: 30, ms: 3000, cnt: 10 },
-  o: { n: 'Oro', k: 'g', lo: 60, hi: 120, ms: 4500, cnt: 3 }, d: { n: 'Diamante', k: 'g', lo: 250, hi: 400, ms: 6500, cnt: 1 } };
+const MINE = { x1: 2400, x2: 4800, y1: 400, y2: 1400, gy: 900 }, ORE_RESET = 30 * 60 * 1000;
+const ORE_T = { c: { n: 'Carbón', k: 'm', lo: 3, hi: 6, ms: 1000, cnt: 88 }, k: { n: 'Cobre', k: 'm', lo: 8, hi: 14, ms: 1800, cnt: 56 }, i: { n: 'Hierro', k: 'm', lo: 18, hi: 30, ms: 3000, cnt: 40 },
+  o: { n: 'Oro', k: 'g', lo: 60, hi: 120, ms: 4500, cnt: 9 }, d: { n: 'Diamante', k: 'g', lo: 250, hi: 400, ms: 6500, cnt: 3 } };
 const ores = new Map(); let oreSeq = 0, oreNext = Date.now() + ORE_RESET;
 const orePub = o => ({ id: o.id, x: o.x, y: o.y });               // a los jugadores solo se les dice dónde hay un mineral, NO cuál es
 function oreSpawnAll() {
