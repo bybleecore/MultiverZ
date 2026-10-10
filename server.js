@@ -133,7 +133,7 @@ function noteStats(p, d) {
   if (!p || !d || typeof d !== 'object' || d.gems === undefined) return;
   const n = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0)), now = Date.now(), g = n(d.gems, 1e9);
   const changed = p.gems !== g;
-  p.gems = g; if (d.av !== undefined) p.av = n(d.av, 1000); p.chars = n(d.chars, 1000); p.wins = n(d.wins, 1e9); p.battles = n(d.battles, 1e9); p.days = n(d.days, 100000); p.gt = now;
+  p.gems = g; if (d.av !== undefined) p.av = cleanAv(d.av); p.chars = n(d.chars, 1000); p.wins = n(d.wins, 1e9); p.battles = n(d.battles, 1e9); p.days = n(d.days, 100000); p.gt = now;
   if (changed && now - lastStatSave > 20000) { lastStatSave = now; save(); }      // no escribir el archivo en cada reporte
 }
 const sockIp = s => firstIp(s.handshake.headers) || s.handshake.address || '';
@@ -392,7 +392,7 @@ app.use('/acct', (err, req, res, next) => res.status(err.status || 400).json({ o
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
-const MAX_ID = 90;                 // sube este número cuando agregues personajes
+const MAX_ID = 100;                // sube este número cuando agregues personajes
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
 const queues = { pvp: [], rank: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida en curso
@@ -406,6 +406,11 @@ const validTeam = (mode, t) =>
                 Number.isInteger(x.l) && x.l >= 0 && x.l <= 5);
 
 const ni = (v, max) => Math.min(max, Math.max(0, Math.floor(Number(v)) || 0));
+// Foto de perfil: número de personaje (1..MAX_ID) o clave de una forma alterna ("a52" = Awaken, "57c", "89k"…)
+const cleanAv = v => {
+  if (typeof v === 'string') { const m = /^(a?)(\d{1,3})([a-z]?)$/.exec(v); return m && +m[2] >= 1 && +m[2] <= MAX_ID ? v : 0; }
+  return ni(v, MAX_ID);
+};
 // Perfil visible para el rival. Nombre = el registrado en el servidor; el resto lo informa el juego del jugador.
 // ===== Ranking de victorias de Rankeds =====
 // Cada victoria ranked cuenta en el servidor (una por partida, y se cuenta aunque el rival se desconecte).
@@ -440,7 +445,7 @@ function rkCredit(s) {                                                  // suma 
 function cleanProf(s, d) {
   d = d || {};
   const p = db.players[s.data.uid];
-  return { name: (p && p.name) || 'Jugador', av: ni(d.av, MAX_ID), gems: ni(d.gems, 1e9), chars: ni(d.chars, MAX_ID),
+  return { name: (p && p.name) || 'Jugador', av: cleanAv(d.av), gems: ni(d.gems, 1e9), chars: ni(d.chars, MAX_ID),
            wins: ni(d.wins, 1e9), rk: d.rk == null ? null : ni(d.rk, 10), pw: ni(d.pw, 1e9), battles: ni(d.battles, 1e9), days: ni(d.days, 100000),
            gold: leaders().has(s.data.uid) };
 }
@@ -716,7 +721,7 @@ io.on('connection', s => {
     if (world.has(s.id)) return;
     if (world.size >= MAX_WORLD) return s.emit('wfull');
     const name = String((d && d.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14) || 'Jugador';
-    const av = d && Number.isInteger(d.av) && d.av >= 0 && d.av <= MAX_ID ? d.av : 0;
+    const av = cleanAv(d && d.av);
     const a = Math.random() * Math.PI * 2, r = POND.r + 150 + Math.random() * 150;
     const p = { id: s.id, name, av, x: POND.x + Math.cos(a) * r, y: POND.y + Math.sin(a) * r, t: Date.now(), dirty: false, lc: 0, ld: 0, lr: 0,
       uid: cleanUid(d && d.uid), fr: new Set((Array.isArray(d && d.fr) ? d.fr : []).slice(0, 300).map(cleanUid)) };
