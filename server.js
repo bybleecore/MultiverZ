@@ -451,6 +451,11 @@ function cleanProf(s, d) {
 }
 
 function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); }
+// Cuántas personas están buscando partida (PvP = sala/rápida + rankeds, y Raid): lo ven todos los juegos
+const searching = () => ({ pvp: queues.pvp.filter(e => e.s.connected).length + queues.rank.filter(e => e.s.connected).length, raid: queues.raid.filter(e => e.s.connected).length });
+app.get('/searching', (_, res) => { res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }); res.json(searching()); });
+let lastSrch = JSON.stringify(searching());
+setInterval(() => { const st = searching(), j = JSON.stringify(st); if (j !== lastSrch) { lastSrch = j; io.emit('srch', st); } }, 1500);   // avisa a los conectados cuando cambia
 
 // El otro jugador de la sala o de la partida (sirve para el chat)
 function peer(s) {
