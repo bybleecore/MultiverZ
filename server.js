@@ -1,4 +1,4 @@
-// Servidor del JUEGO de MultiverZ 9.0 (datos opcionalmente en un servidor aparte: DATA_URL + DATA_KEY): PvP con votación de modo, chat, Raid, mundo abierto, cuentas y baneos
+// Servidor de MultiverZ 8.0: PvP con votación de modo, chat, Raid, mundo abierto, cuentas y baneos
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -30,96 +30,100 @@ try {
   db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {}, crews: d.crews || {}, trd: d.trd || {}, accts: d.accts || {} };
   console.log('Datos cargados: ' + Object.keys(db.players).length + ' jugadores, ' + Object.keys(db.bans).length + ' baneados');
 } catch (e) { console.log('Sin archivo de datos previo: se creará uno nuevo en ' + DATA_FILE); }
+
+// ===== Servidor de datos externo (variables VAULT_URL y VAULT_KEY) =====
+// Si las defines, el juego carga TODO desde tu servidor de datos al arrancar y le manda cada cambio (solo lo que cambió).
+// El data.json local queda como copia de emergencia. Sin estas variables todo funciona como antes.
+const VAULT_URL = String(process.env.VAULT_URL || '').trim().replace(/\/+$/, ''), VAULT_KEY = String(process.env.VAULT_KEY || '').trim();
+const VCOLLS = ['players', 'bans', 'ipbans', 'gifts', 'crews', 'trd', 'accts'];
+const vsent = {}; for (const c of VCOLLS) vsent[c] = new Map();           // lo último que ya está guardado en el servidor de datos
+let vready = !VAULT_URL, vbusy = false, vagain = false, vtimer = null, vseen = 0;
+const vsleep = ms => new Promise(r => setTimeout(r, ms));
+const vown = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const vgate = (req, res, next) => vready ? next() : res.status(503).send('Iniciando: conectando con el servidor de datos…');
+app.use('/admin/api', vgate);
+io.use((s, next) => vready ? next() : next(new Error('Servidor iniciando, reintenta en unos segundos')));   // nadie entra hasta cargar los datos
+async function vreq(method, p, body, ms) {
+  const r = await fetch(VAULT_URL + p, { method, headers: { 'x-key': VAULT_KEY, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(ms || 30000) });
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error('HTTP ' + r.status + (j.error ? ' · ' + j.error : ''));
+  return j;
+}
+function vIndex() { for (const c of VCOLLS) { vsent[c].clear(); for (const [k, v] of Object.entries(db[c])) vsent[c].set(k, JSON.stringify(v)); } }
+function vSoon() { if (!VAULT_URL || !vready || vtimer) return; vtimer = setTimeout(() => { vtimer = null; vFlush(); }, 4000); }
+async function vFlush() {                                                  // manda al servidor de datos lo que cambió desde la última vez
+  if (!VAULT_URL || !vready) return;
+  if (vbusy) { vagain = true; return; }
+  vbusy = true;
+  try {
+    const sets = [], dels = [];
+    for (const c of VCOLLS) {
+      const cur = db[c] || {};
+      for (const [k, v] of Object.entries(cur)) { const s = JSON.stringify(v); if (vsent[c].get(k) !== s) sets.push([c, k, s]); }
+      for (const k of vsent[c].keys()) if (!vown(cur, k)) dels.push([c, k]);
+    }
+    if (dels.length > 250) { console.error('Vault: se negó a borrar ' + dels.length + ' registros de golpe (protección)'); dels.length = 0; }
+    const batches = []; let cur = [], bytes = 0;
+    for (const e of sets) { cur.push(e); bytes += e[2].length + 40; if (bytes > 6e6 || cur.length >= 1500) { batches.push({ set: cur, del: [] }); cur = []; bytes = 0; } }
+    if (cur.length || dels.length) batches.push({ set: cur, del: dels });
+    for (const b of batches) {
+      await vreq('POST', '/vault/batch', b, 60000);
+      for (const [c, k, s] of b.set) vsent[c].set(k, s);
+      for (const [c, k] of b.del) vsent[c].delete(k);
+    }
+    if (sets.length || dels.length) console.log('Vault: ' + sets.length + ' registros guardados, ' + dels.length + ' borrados');
+  } catch (e) {
+    console.error('Vault: no se pudo guardar (' + e.message + '). Reintento en 10 s');
+    clearTimeout(vtimer); vtimer = setTimeout(() => { vtimer = null; vFlush(); }, 10000);
+  }
+  vbusy = false;
+  if (vagain) { vagain = false; vSoon(); }
+}
+async function vCheck() {                                                  // ¿el servidor de datos perdió registros (se reinició/borró)? entonces se le reenvía todo
+  if (!VAULT_URL || !vready || vbusy || vtimer) return;
+  try {
+    const st = await vreq('GET', '/vault/stats', null, 15000);
+    let lost = !!vseen && st.startedAt !== vseen;
+    for (const c of VCOLLS) if (Object.keys(db[c]).length > ((st.counts && st.counts[c]) || 0)) lost = true;
+    vseen = st.startedAt;
+    if (lost) { console.log('Vault: el servidor de datos perdió registros (¿se reinició?). Reenvío todo'); for (const c of VCOLLS) vsent[c].clear(); vSoon(); }
+  } catch (e) { /* se vuelve a intentar en la siguiente vuelta */ }
+}
+setInterval(vCheck, Number(process.env.VAULT_CHECK_MS) || 60000);
+async function vInit() {                                                   // al arrancar: carga todo desde el servidor de datos (espera todo lo que haga falta)
+  if (!VAULT_URL) return;
+  if (!VAULT_KEY) console.warn('⚠ VAULT_URL está definida pero falta VAULT_KEY');
+  const have = o => Object.keys(o || {}).length;
+  for (let i = 1; ; i++) {
+    try {
+      const r = await vreq('GET', '/vault/all', null, 60000);
+      if (r.empty) {
+        console.log(have(db.players) + have(db.accts) + have(db.crews) ? 'Vault vacío: subo los ' + have(db.players) + ' jugadores que había en el archivo local' : 'Vault vacío y sin datos locales: empiezo desde cero');
+        for (const c of VCOLLS) vsent[c].clear();
+      } else {
+        const d = r.db || {};
+        db = { players: d.players || {}, bans: d.bans || {}, ipbans: d.ipbans || {}, gifts: d.gifts || {}, crews: d.crews || {}, trd: d.trd || {}, accts: d.accts || {} };
+        vIndex();
+        console.log('Datos cargados del servidor de datos: ' + have(db.players) + ' jugadores, ' + have(db.accts) + ' cuentas, ' + have(db.crews) + ' crews');
+      }
+      try { vseen = (await vreq('GET', '/vault/stats', null, 15000)).startedAt; } catch (e) {}
+      vready = true; vSoon(); return;
+    } catch (e) { console.log('Servidor de datos no responde (' + e.message + '). Reintento…'); await vsleep(Math.min(30000, 2000 * i)); }
+  }
+}
+vInit();
 const envBans = new Set((process.env.BANNED_UIDS || '').split(',').map(cid).filter(Boolean));
 const envIps = new Set((process.env.BANNED_IPS || '').split(',').map(x => x.trim()).filter(Boolean));
-// ===== Servidor de datos aparte (opcional) =====
-// Con DATA_URL + DATA_KEY, todo lo que no puede perderse (cuentas, crews, ranking, baneos, regalos, intercambios) se guarda TAMBIÉN en el
-// servidor de datos y se vuelve a cargar de ahí al iniciar. Así puedes actualizar ESTE servidor cuantas veces quieras sin perder nada.
-// Sin esas dos variables funciona como siempre (solo el archivo local).
-const DATA_URL = String(process.env.DATA_URL || '').trim().replace(/\/+$/, ''), DATA_KEY = String(process.env.DATA_KEY || '').trim();
-const REMOTE = !!(DATA_URL && DATA_KEY);
-const COLLS = ['players', 'bans', 'ipbans', 'gifts', 'crews', 'trd', 'accts'];
-let ready = !REMOTE;                                       // con servidor de datos, no se acepta a nadie hasta cargar los datos
-const shadow = {}; for (const c of COLLS) shadow[c] = new Map();   // clave -> huella de lo último que el servidor de datos ya tiene
-const hsh = x => crypto.createHash('md5').update(x).digest('base64');
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function vfetch(p, method, body, ms) {
-  const ac = new AbortController(), to = setTimeout(() => ac.abort(), ms || 20000);
-  try {
-    const r = await fetch(DATA_URL + p, { method: method || 'GET', headers: { 'x-key': DATA_KEY, 'content-type': 'application/json' }, body: body || undefined, signal: ac.signal });
-    if (!r.ok) { let m = ''; try { m = (await r.json()).error || ''; } catch (e) {} throw new Error('HTTP ' + r.status + (m ? ' · ' + m : '')); }
-    return await r.json();
-  } finally { clearTimeout(to); }
-}
-async function vaultLoad() {
-  const r = await vfetch('/vault/all', 'GET', null, 70000);                // el servidor de datos puede estar despertando: damos hasta 70 s
-  if (!r || typeof r.db !== 'object') throw new Error('respuesta no válida');
-  const local = COLLS.reduce((n, c) => n + Object.keys(db[c] || {}).length, 0);
-  knownRev = Number(r.rev) || 0;
-  if (r.empty) { console.log(local ? 'El servidor de datos está vacío: le paso los datos de este servidor (' + local + ' registros)' : 'El servidor de datos está vacío: se empieza de cero'); return; }
-  for (const c of COLLS) {
-    for (const k of Object.keys(db[c])) delete db[c][k];
-    shadow[c].clear();
-    for (const [k, v] of Object.entries(r.db[c] || {})) { if (k === '__proto__') continue; db[c][k] = v; shadow[c].set(k, hsh(JSON.stringify(v))); }
-  }
-  console.log('Datos cargados del servidor de datos: ' + Object.keys(db.players).length + ' jugadores, ' + Object.keys(db.accts).length + ' cuentas, ' + Object.keys(db.crews).length + ' crews');
-}
-let chain = Promise.resolve(), kickT = null, knownRev = 0;
-function vaultLost() { console.warn('El servidor de datos perdió sus datos: se los vuelvo a enviar'); for (const c of COLLS) shadow[c].clear(); knownRev = 0; vaultKick(); }
-function vaultKick() { if (!REMOTE || !ready) return; clearTimeout(kickT); kickT = setTimeout(vaultFlush, 1500); }
-function vaultFlush() { chain = chain.then(vaultDoFlush, vaultDoFlush); return chain; }     // los envíos van de uno en uno
-async function vaultDoFlush() {                                                          // envía solo lo que cambió desde la última vez
-  if (!REMOTE || !ready) return true;
-  const set = [], del = [];
-  for (const c of COLLS) {
-    const seen = new Set();
-    for (const k of Object.keys(db[c])) { seen.add(k); const x = JSON.stringify(db[c][k]); if (x === undefined) continue; const h = hsh(x); if (shadow[c].get(k) !== h) set.push([c, k, x, h]); }
-    for (const k of shadow[c].keys()) if (!seen.has(k)) del.push([c, k]);
-  }
-  if (!set.length && !del.length) return true;
-  try {
-    let lost = false;
-    const chunks = []; let cur = [], size = 0;
-    for (const e of set) { if (cur.length && size + e[2].length > 3e6) { chunks.push(cur); cur = []; size = 0; } cur.push(e); size += e[2].length; }
-    if (cur.length || !chunks.length) chunks.push(cur);
-    for (let i = 0; i < chunks.length; i++) {
-      const d = i === 0 ? del : [];
-      const r = await vfetch('/vault/batch', 'POST', JSON.stringify({ set: chunks[i].map(e => [e[0], e[1], e[2]]), del: d }), 30000);
-      for (const e of chunks[i]) shadow[e[0]].set(e[1], e[3]);
-      for (const e of d) shadow[e[0]].delete(e[1]);
-      if (typeof r.rev === 'number') { if (r.rev < knownRev) lost = true; knownRev = r.rev; }     // si el número bajó, el servidor de datos se reinició vacío
-    }
-    if (lost) vaultLost();
-    return true;
-  } catch (e) { console.warn('No se pudo guardar en el servidor de datos (reintento en 5 s):', e.message); clearTimeout(kickT); kickT = setTimeout(vaultFlush, 5000); return false; }
-}
-async function vaultBoot() {
-  if (!REMOTE) return;
-  console.log('Usando el servidor de datos: ' + DATA_URL);
-  for (;;) { try { await vaultLoad(); break; } catch (e) { console.warn('Esperando al servidor de datos (' + e.message + ')…'); await sleep(5000); } }
-  ready = true; console.log('Servidor de datos conectado ✅'); vaultKick();
-  setInterval(() => { vfetch('/vault/stats', 'GET', null, 30000).then(st => { if (st && typeof st.rev === 'number' && st.rev < knownRev) vaultLost(); }).catch(() => {}); }, 4 * 60 * 1000);   // lo mantiene despierto y avisa si perdió los datos
-}
-app.use(['/acct', '/admin/api', '/lockcheck'], (req, res, next) => {
-  if (ready) return next();
-  res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
-  res.status(503).json({ ok: false, error: 'El servidor está iniciando', err: 'El servidor está iniciando, intenta de nuevo en unos segundos' });
-});
 let saveT = null, dirty = false;
 function writeNow() {
   clearTimeout(saveT); dirty = false;
   const tmp = DATA_FILE + '.tmp';
   try { fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, DATA_FILE); }
   catch (e) { console.error('No se pudieron guardar los datos:', e.message); }
-  vaultKick();
 }
-function save() { dirty = true; clearTimeout(saveT); saveT = setTimeout(writeNow, 400); }
+function save() { dirty = true; clearTimeout(saveT); saveT = setTimeout(writeNow, 400); vSoon(); }
 process.on('exit', () => { if (dirty) writeNow(); });                  // no perder cambios pendientes al apagar
-for (const sg of ['SIGTERM', 'SIGINT']) process.on(sg, async () => {      // al apagar: guarda lo pendiente (también en el servidor de datos)
-  const t = setTimeout(() => process.exit(0), 9000);
-  try { writeNow(); await vaultFlush(); } catch (e) {}
-  clearTimeout(t); process.exit(0);
-});
+for (const sg of ['SIGTERM', 'SIGINT']) process.on(sg, async () => { try { if (VAULT_URL && vready) { clearTimeout(vtimer); vtimer = null; await Promise.race([vFlush(), vsleep(8000)]); } } catch (e) {} process.exit(0); });
 const banInfo = uid => db.bans[uid] || (envBans.has(uid) ? { reason: 'Baneo permanente', env: true } : null);
 const ipBanned = ip => !!ip && !!(db.ipbans[ip] || envIps.has(ip));
 const online = new Map();                 // uid -> Set(sockets)
@@ -136,7 +140,6 @@ const sockIp = s => firstIp(s.handshake.headers) || s.handshake.address || '';
 const regIp = new Map();                  // límite de cuentas nuevas por IP
 
 io.use((s, next) => {
-  if (!ready) return next(new Error('iniciando'));
   const a = s.handshake.auth || {};
   const uid = cid(a.uid), tok = String(a.tok || '').slice(0, 64), ip = sockIp(s);
   if (uid.length < 8 || tok.length < 16) return next(new Error('actualiza'));
@@ -170,7 +173,6 @@ io.on('connection', s => {
   if (!online.has(uid)) online.set(uid, new Set());
   online.get(uid).add(s);
   s.emit('bonus', bonusState());                                              // estado del evento x2
-  megaBind(s, uid);                                                            // megabatalla contra Bunny Iglesias
   if (db.gifts[uid] && db.gifts[uid].length) s.emit('gifts', db.gifts[uid]);   // regalos pendientes del admin
   s.on('stat', d => {                                                          // el juego informa sus gemas cada rato
     const p = db.players[uid];
@@ -576,7 +578,7 @@ io.on('connection', s => {
     queues.rank.push({ s, prof: pr, t: Date.now() });
     tryRank();
   });
-  s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 9.0'));   // clientes viejos
+  s.on('find', () => s.emit('err', 'Actualiza el juego a la versión 8.0'));   // clientes viejos
 
   s.on('pvote', d => {
     const L = lobbies.get(s.id), mode = d && d.mode;
@@ -651,118 +653,6 @@ io.on('connection', s => {
   s.on('leave', () => { endMatch(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
   s.on('disconnect', () => { unqueue(s); endMatch(s); lobbyEnd(s, '🔌 Tu rival se desconectó'); });
 });
-
-// ===== Megabatalla contra Bunny Iglesias: una fiesta de hasta 8 jugadores que pelean juntos =====
-// Como en la Raid, el combate se calcula en el juego de cada jugador con la misma semilla; el servidor arma la fiesta,
-// reparte la semilla y pasa a los demás lo que elige cada jugador en cada turno.
-const MEGA_MAX = 8;
-const parties = new Map(), partyOf = new Map(), megas = new Map();   // id de fiesta -> fiesta · socket.id -> fiesta · socket.id -> megabatalla
-const sockById = id => { for (const set of online.values()) for (const x of set) if (x.id === id) return x; return null; };
-const mpBusy = s => partyOf.has(s.id) || megas.has(s.id) || matches.has(s.id) || lobbies.has(s.id);
-const mpPub = (P, s) => ({ host: P.host === s.id, max: MEGA_MAX, members: P.members.map((m, i) => ({ idx: i, name: m.name, av: m.av, ch: m.team[0], host: m.s.id === P.host, me: m.s === s })) });
-const mpPush = P => P.members.forEach(m => m.s.emit('mp', mpPub(P, m.s)));
-function mpDrop(s) {                                     // saca a s de su fiesta (antes de empezar); si era el anfitrión, la fiesta se cierra
-  const P = partyOf.get(s.id); if (!P) return;
-  partyOf.delete(s.id);
-  if (P.host === s.id) {
-    parties.delete(P.id);
-    for (const m of P.members) { partyOf.delete(m.s.id); if (m.s !== s) { m.s.emit('mp', null); m.s.emit('mperr', 'El anfitrión cerró la fiesta'); } }
-  } else { P.members = P.members.filter(m => m.s !== s); mpPush(P); }
-  s.emit('mp', null);
-}
-const mgActive = M => M.members.filter(m => !m.left);
-function mgCheck(M) {                                    // si alguien tarda más de 60 s en elegir mientras los demás ya eligieron, se le saca
-  clearTimeout(M.t);
-  const act = mgActive(M); if (!act.length) return;
-  const mx = Math.max(...act.map(m => m.cnt));
-  if (act.every(m => m.cnt === mx)) return;
-  M.t = setTimeout(() => {
-    const act2 = mgActive(M), mx2 = Math.max(0, ...act2.map(m => m.cnt));
-    for (const m of act2) if (m.cnt < mx2) { m.s.emit('mkicked'); mgLeave(m.s); }
-  }, 60000);
-}
-function mgLeave(s) {                                    // un jugador sale de la megabatalla: los demás saben desde qué turno ya no está
-  const M = megas.get(s.id); if (!M) return;
-  megas.delete(s.id);
-  const mm = M.members.find(m => m.s === s); if (!mm || mm.left) return;
-  mm.left = true;
-  for (const o of mgActive(M)) o.s.emit('mleft', { idx: mm.idx, at: mm.cnt });
-  if (!mgActive(M).length) { clearTimeout(M.t); return; }
-  mgCheck(M);
-}
-const mgActs = (a, idx) => (Array.isArray(a) ? a.slice(0, 2) : []).filter(x => x && typeof x === 'object').map(x => ({    // solo se reenvía lo que se puede jugar: cada quien controla únicamente a su personaje
-  u: idx, i: ni(x.i, 4), t: x.t === 0 ? 0 : -1,
-  cm: Array.isArray(x.cm) ? [x.cm[0] === 0 ? 0 : -1, ni(x.cm[1], 4)] : null,
-  cx: Array.isArray(x.cx) ? [x.cx[0] === 0 ? 0 : -1, ni(x.cx[1], 4)] : null,
-  sh: ni(x.sh, MAX_ID) }));
-function megaBind(s, uid) {
-  const slow = (k, ms) => { const n = Date.now(); if (n - (s.data[k] || 0) < ms) return true; s.data[k] = n; return false; };
-  const me = () => db.players[uid] || {};
-  s.on('mp:create', d => {
-    if (slow('mp1', 800)) return;
-    if (mpBusy(s)) return s.emit('mperr', 'Ya estás en una fiesta o en un combate');
-    if (!d || !validTeam(1, d.team)) return s.emit('mperr', 'Elige 1 personaje');
-    const P = { id: crypto.randomBytes(5).toString('hex'), host: s.id, inv: new Set(), members: [{ s, name: me().name || 'Jugador', av: ni(d.av, MAX_ID), team: d.team }] };
-    parties.set(P.id, P); partyOf.set(s.id, P); mpPush(P);
-  });
-  s.on('mp:online', () => {                              // jugadores conectados a los que se puede invitar
-    if (slow('mp2', 1500)) return;
-    const list = [];
-    for (const [u, set] of online) {
-      if (u === uid) continue;
-      const x = [...set].find(y => !mpBusy(y)); if (!x) continue;
-      const p = db.players[u] || {};
-      list.push({ id: x.id, name: p.name || 'Jugador', av: p.av || 0 });
-      if (list.length >= 40) break;
-    }
-    s.emit('mponline', list);
-  });
-  s.on('mp:invite', d => {                               // solo el anfitrión
-    if (slow('mp3', 400)) return;
-    const P = partyOf.get(s.id), t = d && sockById(String(d.id || ''));
-    if (!P || P.host !== s.id || !t || t === s) return;
-    if (P.members.length >= MEGA_MAX) return s.emit('mperr', 'La fiesta está llena');
-    if (mpBusy(t)) return s.emit('mperr', 'Ese jugador ya está ocupado');
-    if (P.inv.size >= 30) return s.emit('mperr', 'Demasiadas invitaciones');
-    P.inv.add(t.id);
-    t.emit('mpinv', { pid: P.id, from: me().name || 'Jugador', n: P.members.length });
-    s.emit('mpinvd', { id: t.id });
-  });
-  s.on('mp:join', d => {                                 // solo con invitación
-    if (slow('mp4', 800)) return;
-    const P = d && parties.get(String(d.pid || ''));
-    if (!P) return s.emit('mperr', 'Esa fiesta ya no existe');
-    if (!P.inv.has(s.id)) return s.emit('mperr', 'No tienes invitación');
-    if (mpBusy(s)) return s.emit('mperr', 'Ya estás en una fiesta o en un combate');
-    if (P.members.length >= MEGA_MAX) return s.emit('mperr', 'La fiesta está llena');
-    if (!validTeam(1, d.team)) return s.emit('mperr', 'Elige 1 personaje');
-    P.inv.delete(s.id);
-    P.members.push({ s, name: me().name || 'Jugador', av: ni(d.av, MAX_ID), team: d.team });
-    partyOf.set(s.id, P); mpPush(P);
-  });
-  s.on('mp:leave', () => mpDrop(s));
-  s.on('mp:start', () => {                               // solo el anfitrión
-    const P = partyOf.get(s.id);
-    if (!P || P.host !== s.id) return;
-    parties.delete(P.id);
-    const M = { id: P.id, t: null, members: P.members.map((m, i) => ({ s: m.s, idx: i, name: m.name, av: m.av, team: m.team, cnt: 0, left: false })) };
-    const seed = Math.floor(Math.random() * 4294967296), wx = WX[Math.floor(Math.random() * WX.length)];
-    const info = M.members.map(m => ({ idx: m.idx, name: m.name, av: m.av, ch: m.team[0] }));
-    for (const m of M.members) { partyOf.delete(m.s.id); megas.set(m.s.id, M); }
-    for (const m of M.members) m.s.emit('mstart', { seed, wx, idx: m.idx, members: info });
-  });
-  s.on('mplan', p => {
-    const M = megas.get(s.id); if (!M || !p || typeof p !== 'object') return;
-    const mm = M.members.find(m => m.s === s); if (!mm || mm.left) return;
-    mm.cnt++;
-    const out = { idx: mm.idx, rd: ni(p.rd, 1000), a: mgActs(p.a, mm.idx),
-      sw: (Array.isArray(p.sw) ? p.sw.slice(0, 3) : []).map(e => ni(e, 4 * MEGA_MAX + 3)).filter(e => (e >> 2) === mm.idx) };
-    for (const o of M.members) if (o !== mm && !o.left) o.s.emit('mplan', out);
-    mgCheck(M);
-  });
-  s.on('mleave', () => { mpDrop(s); mgLeave(s); });
-  s.on('disconnect', () => { mpDrop(s); mgLeave(s); });
-}
 
 // ===== Mundo abierto: jardín compartido con estanque, chat y gemas escondidas =====
 const WW = 2400, WH = 1800, WY0 = -1000, NPC = { x: 1200, y: -760 }, POND = { x: 1200, y: 900, r: 280 }, SPEED = 240, MAX_WORLD = 60;
@@ -1066,4 +956,3 @@ io.on('connection', s => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('MultiverZ PvP en puerto ' + PORT));
-vaultBoot();
