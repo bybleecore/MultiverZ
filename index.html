@@ -535,7 +535,7 @@ function dclaim(id){const m=DLY.find(x=>x.id==id),d=dqs();if(!m||d.cl[id]||dqp(m
 function claim(id){const m=MS.find(x=>x.id==id);if(S.cl[id])return;S.cl[id]=1;S.gems+=m.r;S.tk=(S.tk||0)+(m.tk||0);sv();ui();miss()}
 const GF=[['g90','Regalo por la versión 9.0','💎10000',10000,0]];
 function gifts(){modal(`<h2>🎁 Regalos</h2>${GF.map(([k,n,rw])=>`<div class="ms">${n} — ${rw||'💎1000'}<br><button class="b" ${S.gf[k]?'disabled':''} onclick="gf('${k}')">${S.gf[k]?'Reclamado':'Reclamar'}</button></div>`).join('')}`)}
-const CODES={'THANKS FOR PLAYING':5000,'ONLYFORADMIN':10000,'THANKSFORWATCHING':3000,'TICKETS6767':{g:4000,t:67},'FORTEST8282911':{g:10000},'20PLAYERS001':{g:5000,t:50},'SORRYFORRUSHEXPLOID26':{g:2600,t:26}};
+const CODES={'THANKS FOR PLAYING':5000,'ONLYFORADMIN':10000,'THANKSFORWATCHING':3000,'TICKETS6767':{g:4000,t:67},'FORTEST8282911':{g:10000},'20PLAYERS001':{g:5000,t:50},'SORRYFORRUSHEXPLOID26':{g:2600,t:26},'THANKSFOR40PLAYERS4K':{g:8000,t:40}};
 function codes(){modal(`<h2>🔑 Códigos</h2><p>Días de login: ${S.days}</p><input id="ci" placeholder="Escribe tu código" style="width:100%"><button class="b" onclick="redeem()">Canjear</button><p id="cm"></p>`)}
 function redeem(){const v=$('#ci').value.trim().toUpperCase().replace(/\s+/g,' '),g=CODES[v],m=$('#cm');if(!g)return m.textContent='Código no válido';if(S.cd[v])return m.textContent='Ya canjeaste este código';S.cd[v]=1;const r=typeof g=='object'?g:{g:g};S.gems+=r.g||0;S.tk=(S.tk||0)+(r.t||0);sv();ui();m.textContent=`¡Código canjeado! +💎${r.g||0}${r.t?' +🎫'+r.t:''}`}
 function gf(k){const g=GF.find(x=>x[0]==k);if(!g||S.gf[k])return;S.gf[k]=1;S.gems+=g[3]||0;S.tk=(S.tk||0)+(g[4]||0);sv();ui();gifts();gBadge()}
