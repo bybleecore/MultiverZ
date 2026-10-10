@@ -450,9 +450,19 @@ function cleanProf(s, d) {
            gold: leaders().has(s.data.uid) };
 }
 
-function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); }
+function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); raidDrop(s); }
+// RaidOnline: partidas abiertas (el jugador crea una y otros se unen desde la pantalla de la raid)
+const raidRooms = new Map(); let raidSeq = 0;
+const raidList = () => [...raidRooms.values()].filter(r => r.s.connected).map(r => ({ id: r.id, name: r.name, av: r.av, team: r.team }));
+const raidPush = () => io.to('raidlobby').emit('raidrooms', raidList());
+function raidDrop(s) { let ch = false; for (const [id, r] of raidRooms) if (r.s === s) { raidRooms.delete(id); ch = true; } if (ch) raidPush(); }
+setInterval(() => {                                   // limpia partidas de jugadores desconectados o con más de 10 min esperando
+  const now = Date.now(); let ch = false;
+  for (const [id, r] of raidRooms) if (!r.s.connected || now - r.t > 600000) { raidRooms.delete(id); ch = true; if (r.s.connected) r.s.emit('err', 'Tu partida de Raid expiró (10 min sin compañero)'); }
+  if (ch) raidPush();
+}, 20000);
 // Cuántas personas están buscando partida (PvP = sala/rápida + rankeds, y Raid): lo ven todos los juegos
-const searching = () => ({ pvp: queues.pvp.filter(e => e.s.connected).length + queues.rank.filter(e => e.s.connected).length, raid: queues.raid.filter(e => e.s.connected).length });
+const searching = () => ({ pvp: queues.pvp.filter(e => e.s.connected).length + queues.rank.filter(e => e.s.connected).length, raid: [...raidRooms.values()].filter(r => r.s.connected).length });
 app.get('/searching', (_, res) => { res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }); res.json(searching()); });
 let lastSrch = JSON.stringify(searching());
 setInterval(() => { const st = searching(), j = JSON.stringify(st); if (j !== lastSrch) { lastSrch = j; io.emit('srch', st); } }, 1500);   // avisa a los conectados cuando cambia
@@ -627,11 +637,23 @@ io.on('connection', s => {
   });
 
   // RaidOnline: dos jugadores (2 personajes cada uno) se emparejan como compañeros
-  s.on('findraid', d => {
+  s.on('raidwatch', () => { s.join('raidlobby'); s.emit('raidrooms', raidList()); });   // ve las partidas abiertas
+  s.on('raidunwatch', () => s.leave('raidlobby'));
+  s.on('raidcreate', d => {                                                              // crea una partida y espera compañero
     if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
     endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
-    queues.raid.push({ s, team: d.team });
-    tryRaid();
+    const p = db.players[s.data.uid];
+    raidRooms.set(++raidSeq, { id: raidSeq, s, name: String((p && p.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14), av: cleanAv(d.av),
+      team: d.team.map(x => ({ id: x.id, l: x.l })), t: Date.now() });
+    raidPush();
+  });
+  s.on('raidjoin', d => {                                                                // se une a la partida de otro jugador
+    if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
+    const r = raidRooms.get(Number(d.id));
+    if (!r || !r.s.connected || r.s === s) { s.emit('raidrooms', raidList()); return s.emit('err', 'Esa partida ya no está disponible'); }
+    endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
+    raidRooms.delete(r.id); raidPush();
+    startMatch(r.s, r.team, s, d.team, true);
   });
 
   s.on('cancel', () => { unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
