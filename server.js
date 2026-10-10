@@ -452,17 +452,47 @@ function cleanProf(s, d) {
 
 function unqueue(s) { for (const m in queues) queues[m] = queues[m].filter(e => e.s !== s); raidDrop(s); }
 // RaidOnline: partidas abiertas (el jugador crea una y otros se unen desde la pantalla de la raid)
+// Cada partida es una sala: uno la crea, otro se une; cada uno elige 2 personajes y pulsa "Listo". Cuando los dos están listos empieza.
 const raidRooms = new Map(); let raidSeq = 0;
-const raidList = () => [...raidRooms.values()].filter(r => r.s.connected).map(r => ({ id: r.id, name: r.name, av: r.av, team: r.team }));
+// sala = { id, size (2 o 3 jugadores), m: [anfitrión, ...invitados], t }; cada miembro = { s, name, av, team, ready }
+const raidList = () => [...raidRooms.values()].filter(r => r.m[0].s.connected && r.m.length < r.size).map(r => ({ id: r.id, name: r.m[0].name, av: r.m[0].av, size: r.size, n: r.m.length }));
 const raidPush = () => io.to('raidlobby').emit('raidrooms', raidList());
-function raidDrop(s) { let ch = false; for (const [id, r] of raidRooms) if (r.s === s) { raidRooms.delete(id); ch = true; } if (ch) raidPush(); }
-setInterval(() => {                                   // limpia partidas de jugadores desconectados o con más de 10 min esperando
+const raidSide = x => ({ name: x.name, av: x.av, ready: !!x.ready, team: x.ready ? x.team : null });
+function raidState(r) {
+  const ms = r.m.map(raidSide);
+  r.m.forEach((x, i) => x.s.emit('raidroom', { id: r.id, size: r.size, me: i, members: ms }));
+}
+const raidOf = s => { for (const r of raidRooms.values()) if (r.m.some(x => x.s === s)) return r; return null; };
+function raidDrop(s) {                                  // el jugador sale de su sala (o se desconecta)
+  let ch = false;
+  for (const [id, r] of [...raidRooms]) {
+    const i = r.m.findIndex(x => x.s === s);
+    if (i < 0) continue;
+    ch = true;
+    if (i === 0) { raidRooms.delete(id); r.m.slice(1).forEach(x => x.s.emit('raidclosed', { msg: '🔌 ' + r.m[0].name + ' cerró la partida' })); }
+    else { r.m.splice(i, 1); r.t = Date.now(); raidState(r); }
+  }
+  if (ch) raidPush();
+}
+setInterval(() => {                                   // limpia salas de jugadores desconectados o con más de 10 min sin actividad
   const now = Date.now(); let ch = false;
-  for (const [id, r] of raidRooms) if (!r.s.connected || now - r.t > 600000) { raidRooms.delete(id); ch = true; if (r.s.connected) r.s.emit('err', 'Tu partida de Raid expiró (10 min sin compañero)'); }
+  for (const [id, r] of raidRooms) if (!r.m[0].s.connected || now - r.t > 600000) {
+    raidRooms.delete(id); ch = true;
+    r.m.forEach((x, i) => { if (x.s.connected) x.s.emit('raidclosed', { msg: i ? 'La partida de Raid expiró' : 'Tu partida de Raid expiró (10 min sin actividad)' }); });
+  }
   if (ch) raidPush();
 }, 20000);
+// Raid de 3: reutiliza la sincronización de la megabatalla (cada turno cada jugador manda su plan y el servidor lo reenvía)
+function raid3Start(r) {
+  const P = { pid: 'r' + (++pidSeq) + Math.random().toString(36).slice(2, 6), host: r.m[0].s.id, members: [], inv: new Set(), started: true, timers: {}, got: {} };
+  r.m.forEach(x => P.members.push({ s: x.s, name: x.name, av: x.av, ch: x.team, last: -1, left: false }));
+  parties.set(P.pid, P); r.m.forEach(x => partyOf.set(x.s.id, P));
+  const seed = Math.floor(Math.random() * 4294967296), wx = WX[Math.floor(Math.random() * WX.length)];
+  const members = r.m.map(x => ({ name: x.name, av: x.av, team: x.team }));
+  P.members.forEach((m, i) => m.s.emit('r3start', { idx: i, members, seed, wx }));
+}
 // Cuántas personas están buscando partida (PvP = sala/rápida + rankeds, y Raid): lo ven todos los juegos
-const searching = () => ({ pvp: queues.pvp.filter(e => e.s.connected).length + queues.rank.filter(e => e.s.connected).length, raid: [...raidRooms.values()].filter(r => r.s.connected).length });
+const searching = () => ({ pvp: queues.pvp.filter(e => e.s.connected).length + queues.rank.filter(e => e.s.connected).length, raid: [...raidRooms.values()].filter(r => r.m[0].s.connected).length });
 app.get('/searching', (_, res) => { res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }); res.json(searching()); });
 let lastSrch = JSON.stringify(searching());
 setInterval(() => { const st = searching(), j = JSON.stringify(st); if (j !== lastSrch) { lastSrch = j; io.emit('srch', st); } }, 1500);   // avisa a los conectados cuando cambia
@@ -639,22 +669,38 @@ io.on('connection', s => {
   // RaidOnline: dos jugadores (2 personajes cada uno) se emparejan como compañeros
   s.on('raidwatch', () => { s.join('raidlobby'); s.emit('raidrooms', raidList()); });   // ve las partidas abiertas
   s.on('raidunwatch', () => s.leave('raidlobby'));
-  s.on('raidcreate', d => {                                                              // crea una partida y espera compañero
-    if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
+  s.on('raidcreate', d => {                                                              // crea una sala (de 2 o de 3 jugadores) y espera compañeros
     endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
+    if (partyOf.has(s.id)) return s.emit('err', 'Termina tu fiesta o batalla antes de crear una Raid');
     const p = db.players[s.data.uid];
-    raidRooms.set(++raidSeq, { id: raidSeq, s, name: String((p && p.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14), av: cleanAv(d.av),
-      team: d.team.map(x => ({ id: x.id, l: x.l })), t: Date.now() });
-    raidPush();
+    const r = { id: ++raidSeq, size: d && d.size === 3 ? 3 : 2, t: Date.now(),
+      m: [{ s, name: String((p && p.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14), av: cleanAv(d && d.av), team: null, ready: false }] };
+    raidRooms.set(r.id, r); raidState(r); raidPush();
   });
-  s.on('raidjoin', d => {                                                                // se une a la partida de otro jugador
-    if (!d || !validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
-    const r = raidRooms.get(Number(d.id));
-    if (!r || !r.s.connected || r.s === s) { s.emit('raidrooms', raidList()); return s.emit('err', 'Esa partida ya no está disponible'); }
+  s.on('raidjoin', d => {                                                                // se une a la sala de otro jugador
     endMatch(s); unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala');
-    raidRooms.delete(r.id); raidPush();
-    startMatch(r.s, r.team, s, d.team, true);
+    if (partyOf.has(s.id)) return s.emit('err', 'Termina tu fiesta o batalla antes de unirte a una Raid');
+    const r = d && raidRooms.get(Number(d.id));
+    if (!r || !r.m[0].s.connected || r.m.length >= r.size || r.m[0].s === s) { s.emit('raidrooms', raidList()); return s.emit('err', 'Esa partida ya no está disponible'); }
+    const p = db.players[s.data.uid];
+    r.m.push({ s, name: String((p && p.name) || 'Jugador').replace(/[<>]/g, '').slice(0, 14), av: cleanAv(d.av), team: null, ready: false });
+    r.t = Date.now(); raidState(r); raidPush();
   });
+  s.on('raidready', d => {                                                               // elige equipo y se marca Listo (o lo quita)
+    const r = raidOf(s); if (!r) return;
+    const me = r.m.find(x => x.s === s);
+    r.t = Date.now();
+    if (!d || !d.on) { me.ready = false; return raidState(r); }
+    if (!validTeam(2, d.team)) return s.emit('err', 'Equipo inválido');
+    me.team = d.team.map(x => ({ id: x.id, l: x.l })); me.ready = true;
+    if (r.m.length === r.size && r.m.every(x => x.ready)) {                              // todos listos: empieza
+      raidRooms.delete(r.id); raidPush();
+      if (r.size === 2) startMatch(r.m[0].s, r.m[0].team, r.m[1].s, r.m[1].team, true); else raid3Start(r);
+      return;
+    }
+    raidState(r);
+  });
+  s.on('raidexit', () => raidDrop(s));
 
   s.on('cancel', () => { unqueue(s); lobbyEnd(s, '🔌 Tu rival salió de la sala'); });
 
