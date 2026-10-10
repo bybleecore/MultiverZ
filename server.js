@@ -392,7 +392,16 @@ app.use('/acct', (err, req, res, next) => res.status(err.status || 400).json({ o
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (_, res) => res.send('ok'));
 
-const MAX_ID = 100;                // sube este número cuando agregues personajes
+// Número de personajes: se calcula solo contando los que hay en index.html (así los nuevos ya funcionan en PvP, Raid y fiestas).
+// Si algún día no se pudiera leer, se usa 120 como mínimo.
+const MAX_ID = (() => {
+  let n = 0;
+  try {
+    const t = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8'), a = t.indexOf('const CH=['), b = t.indexOf('].map((c,i)=>(c.id=i+1', a);
+    if (a >= 0 && b > a) n = (t.slice(a, b).match(/^\{n:'/gm) || []).length;
+  } catch (e) {}
+  return Math.max(120, n);
+})();
 const WX = ['Soleado', 'Nocturno', 'Lluvioso', 'Nublado'];
 const queues = { pvp: [], rank: [], raid: [] };   // pvp = sala de votación 1vs1/2vs2/3vs3 · raid = RaidOnline 2vs2 cooperativo
 const matches = new Map();         // socket.id -> partida en curso
