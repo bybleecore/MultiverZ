@@ -960,4 +960,116 @@ io.on('connection', s => {
 });
 
 const PORT = process.env.PORT || 3000;
+// =====================================================================
+//  MEGABATALLA CONTRA BUNNY IGLESIAS: fiesta de hasta 8 jugadores
+//  Flujo: el anfitrión crea la fiesta (mp:create) -> invita a jugadores conectados (mp:online / mp:invite)
+//  -> cada invitado se une con 1 personaje (mp:join) -> el anfitrión empieza (mp:start) y todos reciben
+//  la misma semilla (mstart). Durante el combate el servidor solo reenvía las acciones de cada turno (mplan).
+// =====================================================================
+const MP_MAX = 8, MP_PLAN_MS = Number(process.env.MP_PLAN_MS) || 60000;
+const parties = new Map();                 // pid -> fiesta
+const partyOf = new Map();                 // socket.id -> fiesta
+let pidSeq = 0;
+const mpName = s => ((db.players[s.data.uid] || {}).name) || 'Jugador';
+const mpFree = s => s && s.connected !== false && !partyOf.has(s.id) && !matches.has(s.id) && !lobbies.has(s.id);
+function mpState(P, viewer) {
+  return { pid: P.pid, max: MP_MAX, host: P.host === viewer.id,
+    members: P.members.map(m => ({ id: m.s.id, name: m.name, av: m.av, ch: m.ch, host: m.s.id === P.host, me: m.s === viewer })) };
+}
+const mpPush = P => P.members.forEach(m => { if (!m.left) m.s.emit('mp', mpState(P, m.s)); });
+function mpGone(P, idx, at) {              // un jugador sale en pleno combate: los demás dejan de esperar su plan desde la ronda "at"
+  const m = P.members[idx]; if (!m || m.left) return;
+  m.left = true; m.at = at;
+  partyOf.delete(m.s.id);
+  P.members.forEach((o, i) => { if (i !== idx && !o.left) o.s.emit('mleft', { idx, at }); });
+  if (P.members.every(x => x.left)) { Object.values(P.timers).forEach(clearTimeout); parties.delete(P.pid); }
+}
+function mpLeave(s) {
+  const P = partyOf.get(s.id); if (!P) return;
+  const idx = P.members.findIndex(m => m.s === s);
+  if (P.started) { mpGone(P, idx, P.members[idx].last + 1); return; }
+  if (P.host === s.id) {                   // si se va el anfitrión, la fiesta se deshace
+    P.members.forEach(m => { partyOf.delete(m.s.id); if (m.s !== s) m.s.emit('mp', null); });
+    parties.delete(P.pid); return;
+  }
+  P.members.splice(idx, 1); partyOf.delete(s.id); mpPush(P);
+}
+function mpTimer(P, rd) {                  // si alguien tarda más de 60 s en mandar su plan de la ronda, se le expulsa
+  if (P.timers[rd] || P.done) return;
+  P.timers[rd] = setTimeout(() => {
+    delete P.timers[rd];
+    P.members.forEach((m, i) => {
+      if (!m.left && !(P.got[rd] && P.got[rd].has(i))) { m.s.emit('mkicked'); mpGone(P, i, rd); }
+    });
+  }, MP_PLAN_MS);
+}
+io.on('connection', s => {
+  s.on('mp:create', d => {
+    if (!d || !validTeam(1, d.team)) return s.emit('mperr', 'Equipo inválido');
+    if (partyOf.has(s.id)) return s.emit('mperr', 'Ya estás en una fiesta');
+    if (matches.has(s.id) || lobbies.has(s.id)) return s.emit('mperr', 'Termina tu partida antes de crear una fiesta');
+    const P = { pid: 'p' + (++pidSeq) + Math.random().toString(36).slice(2, 6), host: s.id, members: [], inv: new Set(), started: false, timers: {}, got: {} };
+    P.members.push({ s, name: mpName(s), av: cleanAv(d.av), ch: { id: d.team[0].id, l: d.team[0].l }, last: -1, left: false });
+    parties.set(P.pid, P); partyOf.set(s.id, P);
+    mpPush(P);
+  });
+  s.on('mp:online', () => {                // jugadores conectados a los que se puede invitar
+    const P = partyOf.get(s.id); if (!P || P.host !== s.id || P.started) return;
+    const now = Date.now(); if (now - (s.data.mo || 0) < 800) return; s.data.mo = now;
+    const out = [];
+    for (const [uid, set] of online) {
+      if (uid === s.data.uid || banInfo(uid)) continue;
+      const t = [...set].find(mpFree); if (!t) continue;
+      out.push({ id: t.id, name: mpName(t), av: cleanAv((db.players[uid] || {}).av) });
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name)); s.emit('mponline', out.slice(0, 40));
+  });
+  s.on('mp:invite', d => {
+    const P = partyOf.get(s.id); if (!P || P.host !== s.id || P.started || !d) return;
+    const now = Date.now(); if (now - (s.data.mv || 0) < 600) return; s.data.mv = now;
+    if (P.members.length >= MP_MAX) return s.emit('mperr', 'La fiesta está llena');
+    const t = io.sockets.sockets.get(String(d.id));
+    if (!t || !mpFree(t)) return s.emit('mperr', 'Ese jugador ya no está disponible');
+    P.inv.add(t.data.uid);
+    t.emit('mpinv', { pid: P.pid, from: mpName(s), n: P.members.length });
+    s.emit('mpinvd');
+  });
+  s.on('mp:join', d => {
+    const P = d && parties.get(String(d.pid));
+    if (!P || P.started) return s.emit('mperr', 'La fiesta ya no existe o ya empezó');
+    if (!validTeam(1, d.team)) return s.emit('mperr', 'Equipo inválido');
+    if (partyOf.has(s.id)) return s.emit('mperr', 'Ya estás en una fiesta');
+    if (matches.has(s.id) || lobbies.has(s.id)) return s.emit('mperr', 'Termina tu partida antes de unirte');
+    if (!P.inv.has(s.data.uid)) return s.emit('mperr', 'Necesitas una invitación del anfitrión');
+    if (P.members.length >= MP_MAX) return s.emit('mperr', 'La fiesta está llena');
+    P.members.push({ s, name: mpName(s), av: cleanAv(d.av), ch: { id: d.team[0].id, l: d.team[0].l }, last: -1, left: false });
+    partyOf.set(s.id, P); P.inv.delete(s.data.uid);
+    mpPush(P);
+  });
+  s.on('mp:start', () => {
+    const P = partyOf.get(s.id); if (!P || P.host !== s.id || P.started) return;
+    P.started = true; P.inv.clear();
+    const seed = Math.floor(Math.random() * 4294967296), wx = WX[Math.floor(Math.random() * WX.length)];
+    const members = P.members.map(m => ({ name: m.name, av: m.av, ch: m.ch }));
+    P.members.forEach((m, i) => m.s.emit('mstart', { idx: i, members, seed, wx }));
+  });
+  s.on('mp:leave', () => mpLeave(s));
+  s.on('mleave', () => mpLeave(s));
+  s.on('mplan', p => {                     // cada turno cada jugador manda sus acciones; el servidor solo las reenvía a los demás
+    const P = partyOf.get(s.id);
+    if (!P || !P.started || !p || typeof p !== 'object') return;
+    const idx = P.members.findIndex(m => m.s === s), me = P.members[idx];
+    if (idx < 0 || me.left) return;
+    const rd = Math.max(0, Math.floor(Number(p.rd)) || 0);
+    const a = Array.isArray(p.a) ? p.a.slice(0, 6) : [], sw = Array.isArray(p.sw) ? p.sw.slice(0, 6) : [];
+    if (JSON.stringify({ a, sw }).length > 6000) return;
+    me.last = Math.max(me.last, rd);
+    (P.got[rd] = P.got[rd] || new Set()).add(idx);
+    P.members.forEach((m, i) => { if (i !== idx && !m.left) m.s.emit('mplan', { idx, rd, a, sw }); });
+    if (P.members.every(m => m.left || P.got[rd].has(P.members.indexOf(m)))) { clearTimeout(P.timers[rd]); delete P.timers[rd]; delete P.got[rd - 3]; }
+    else mpTimer(P, rd);
+  });
+  s.on('disconnect', () => mpLeave(s));
+});
+
 server.listen(PORT, () => console.log('MultiverZ PvP en puerto ' + PORT));
